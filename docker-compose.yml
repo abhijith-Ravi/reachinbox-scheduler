@@ -1,0 +1,50 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-reachinbox_dev}
+      MYSQL_USER: ${MYSQL_USER:-reachinbox_dev}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-local_app_password_change_me}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+    ports:
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mysqladmin ping --protocol=TCP --host=127.0.0.1
+          --user=root --password="$${MYSQL_ROOT_PASSWORD}" --silent
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks:
+      - reachinbox_local
+
+  redis:
+    image: redis:7.4
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - reachinbox_local
+
+volumes:
+  mysql_data:
+  redis_data:
+
+networks:
+  reachinbox_local:
+    driver: bridge
