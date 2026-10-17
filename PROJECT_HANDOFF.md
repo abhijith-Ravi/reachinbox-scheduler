@@ -2,21 +2,32 @@
 
 Audit date: 2026-10-17 (Asia/Kolkata)
 
-## Backend foundation milestone update (2026-10-17)
+## Backend scheduling and rate-limit milestone update (2026-10-17)
 
 This update supersedes the initial starter-state implementation matrix and validation section below.
 
 | Area | Current implementation and actual verification |
 |---|---|
-| Database | Prisma 6.19 models `Sender`, `Email`, and `EmailOutbox`; unique idempotency/job keys and status/schedule indexes. Migration `20261017000000_initial_scheduler` is recorded as applied. Its first attempt stopped on redundant `_prisma_migrations` DDL after the three app tables had been created; that DDL was removed, all three actual table definitions were inspected, then Prisma marked the migration applied. No data or volumes were reset. `prisma validate`, `migrate status`, `migrate deploy` (no pending work), and schema diff (empty) passed against MySQL at `127.0.0.1:13306`. |
+| Database | Prisma 6.19 models `Sender`, `Email`, and `EmailOutbox`; unique idempotency/job keys and status/schedule indexes. This milestone adds nullable `Sender.hourlyLimit` with additive migration `20261017120000_sender_rate_limits`. `prisma validate`, `migrate deploy`, and `migrate status` passed; database is up to date. No data or volumes were reset. |
 | API | `POST /api/emails/schedule`, `GET /api/emails/scheduled`, `GET /api/emails/sent`, `GET /api/emails/:id`, and preserved `GET /health`. Integration tests cover validation, lists/details, replay/conflict, and concurrent idempotency. Compiled API health probe returned HTTP 200 with `{"status":"ok"}`. |
-| Queue and recovery | BullMQ 6 + Redis, stable job ID per Email, SQL transactional outbox, startup reconciliation in API/worker, and same-key enqueue retry. Tests covered Redis enqueue failure recovery and restoration of a missing delayed job. No cron or periodic scheduler. |
-| Worker and state | Separate worker entrypoint; configurable concurrency, capped attempts, exponential backoff, conditional transitions `SCHEDULED → PROCESSING → SENT/FAILED`, persisted attempts/errors. Mock-SMTP tests covered accepted status, duplicate job guard, and final retry failure. |
+| Queue and recovery | BullMQ 6 + Redis, stable job ID per Email, SQL transactional outbox, startup reconciliation in API/worker, and same-key enqueue retry. Redis Lua reservation coordinates minimum send-start spacing and rolling 60-minute sender quotas atomically across workers. Denied jobs return to BullMQ delayed state; email rows remain `SCHEDULED`. No cron or periodic scheduler. |
+| Worker and state | Separate worker entrypoint; configurable concurrency, capped attempts, exponential backoff, conditional transitions `SCHEDULED → PROCESSING → SENT/FAILED`, persisted SMTP attempts/errors. SMTP retries reuse an email's Redis quota reservation within the rolling window. Deferrals and Redis coordination errors do not increment SMTP attempt count. |
 | SMTP | Nodemailer Ethereal transport is implemented and requires credentials before worker startup. Missing-credential check produced the expected clear startup error. No credentials are configured, so real Ethereal delivery and preview URL were not verified. `SENT` means SMTP acceptance, not inbox delivery. |
-| Validation | PASS: clean backend `npm ci`, Prisma client generation/validation/migration state, typecheck/build, compiled API health, and all 7 DB/Redis integration tests. Tests use mocked SMTP and targeted cleanup; post-test SQL counts confirmed zero test email/outbox rows. |
-| Git and files | Current base commit is `351ab28`. Changes for this milestone are local and uncommitted. Frontend code was not modified. `.env` remains absent and untouched. |
+| Validation | PASS: Prisma client generation and schema validation; typecheck; production build; additive migration deploy/status; all 19 integration tests against development MySQL/Redis, including zero-limit parking, real Redis concurrency and BullMQ delayed-job worker restart. Tests use mocked SMTP, unique sender/email IDs, and targeted cleanup. SMTP delivery was not tested. |
+| Git and files | Base commit is `ae5a478` (`feat: implement email scheduling backend`). This milestone's changes are local and uncommitted. Frontend code was not modified. `.env` remains untouched. |
 
-Known boundary: MySQL and Redis cannot share one atomic transaction. Startup reconciliation and same-key retries repair pending work; without a retry or restart, an enqueue failure can leave an outbox row pending. A crash after SMTP acceptance but before MySQL records success remains ambiguous and can lead to a duplicate on retry. Exactly-once SMTP delivery is not claimed.
+Known boundaries: MySQL, Redis, and SMTP cannot share one atomic transaction. Startup reconciliation and same-key retries repair pending outbox work. Redis Lua makes each sender reservation atomic and uses Redis server time, but data loss can erase recent rate history. A reservation is conservative: a crash before SMTP consumes quota until its 60-minute entry expires. A crash after SMTP acceptance but before MySQL records success remains ambiguous and can lead to duplicate delivery. Exactly-once SMTP delivery is not claimed.
+
+Commands run for this milestone (from `backend/`, using the Node 22/npm 10 toolchain and command-scoped local connection values; `.env` was not created or edited): `npm run prisma:generate`, `npm run prisma:validate`, `npm run typecheck`, `npm run build`, `npm run db:migrate`, `npx prisma migrate status`, and `npm test`. The migration was applied to the existing development database without reset/recreation. The suite reports 19 passed, 0 failed. Real SMTP was not exercised because credentials are absent.
+
+### Rate-limit semantics
+
+- `EMAIL_MIN_SEND_DELAY_MS` defaults to 1000 ms and is measured between atomic Redis send-start reservations immediately before SMTP invocation. `0` disables the interval.
+- `SENDER_MAX_EMAILS_PER_HOUR` defaults to 100 unique email reservations in any rolling 60-minute window. `Sender.hourlyLimit`, when non-null, overrides the default for that sender.
+- Sender ID scopes the Redis keys. A Lua script checks/prunes the sorted set, checks the previous reservation time, and writes the unique email reservation and sender's last-start time as one operation.
+- A retry with the same email ID reuses its quota reservation while present in the rolling window. It must still satisfy the minimum interval. A denied job is moved into BullMQ's delayed state and the MySQL row remains `SCHEDULED`; no SMTP attempt is recorded.
+- An effective hourly limit of `0` disables sending. The Lua script fails closed without changing the quota set; jobs remain `SCHEDULED` and are parked for 24 hours between checks to avoid a retry loop. Set that sender's `hourlyLimit` to a positive number, or set it to `null` and configure a positive global default, to resume. A worker restart is required for environment changes; the delayed job is reconsidered within 24 hours after the change/restart. Global env validation requires a positive value, while the limiter still fails closed if passed zero.
+- Redis errors return the row to `SCHEDULED` and use bounded BullMQ exponential retries. If these infrastructure retries exhaust, startup reconciliation restores it after Redis recovers. Redis persistence/AOF is required to retain recent quota history over Redis restarts.
 
 ## Environment validation update (2026-10-17)
 
@@ -47,7 +58,7 @@ Current stack: React + TypeScript + Vite + Tailwind CSS; Express + TypeScript; P
 
 ## Architecture and intended responsibilities
 
-The current architecture is only a starter. The assignment's intended responsibilities, pending implementation, are: React dashboard and compose flow; Express API and OAuth/session endpoints; relational persistence for users, senders, campaigns, recipients, and email status; BullMQ delayed jobs on Redis; worker-managed delivery and atomic quota enforcement; Elasticsearch indexing/search; Slack OAuth connection storage and quota notifications; Bull Board for queue operations. Keep SMTP acceptance distinct from confirmed delivery: an SMTP server accepting a message does not prove inbox delivery. Do not claim exactly-once SMTP delivery; use idempotency and duplicate prevention around job processing while documenting the delivery boundary.
+The current implementation covers the backend scheduling foundation, transactional outbox, SMTP worker, sender pacing, and atomic sender hourly reservations. Remaining assignment responsibilities include the React dashboard and compose flow; OAuth/session endpoints; Elasticsearch search; Slack OAuth and quota notifications; and Bull Board. Keep SMTP acceptance distinct from confirmed delivery: an SMTP server accepting a message does not prove inbox delivery. Exactly-once SMTP delivery is not claimed.
 
 ## Requirement status matrix
 
@@ -62,10 +73,10 @@ Legend: **Verified** means supported by current source/config inspection. Valida
 | Persistent delayed scheduling; no cron | BullMQ delayed jobs plus DB transactional outbox | Implemented; recovery tests PASS; no cron used | No current work in this slice | P0 |
 | Multiple senders | `Sender` relation and senderId in API; `default` seeded from config | Data model implemented; sender administration API NOT IMPLEMENTED | Add sender management later | P1 |
 | Configurable worker concurrency | `WORKER_CONCURRENCY` and BullMQ Worker | Implemented by code/config; compile PASS | Validate under real SMTP load later | P1 |
-| Configurable minimum send delay | No implementation | NOT IMPLEMENTED | Implement later | P1 |
-| Configurable hourly quotas | No implementation | NOT IMPLEMENTED | Implement later | P1 |
-| Atomic rate limiting across workers | No implementation | NOT IMPLEMENTED | Implement later | P0 |
-| Reschedule on quota exhaustion | No quota handling or Slack notification | NOT IMPLEMENTED | Implement later | P1 |
+| Configurable minimum send delay | `EMAIL_MIN_SEND_DELAY_MS`; Redis Lua sender start reservation | Implemented; Redis pacing and worker reschedule tests PASS | Tune for deployment needs | P1 |
+| Configurable hourly quotas | `SENDER_MAX_EMAILS_PER_HOUR` default plus nullable per-sender `Sender.hourlyLimit` | Implemented as rolling 60-minute unique email reservations; integration tests PASS | Sender administration API is future work | P1 |
+| Atomic rate limiting across workers | Redis Lua script uses Redis server time and sender-scoped keys | Implemented; simultaneous Redis reservations and concurrent-worker integration tests PASS | Redis persistence remains a prerequisite | P0 |
+| Reschedule on quota exhaustion | BullMQ `moveToDelayed`; database email returns to `SCHEDULED` | Implemented; record-preservation and delayed worker restart tests PASS | None in this slice | P1 |
 | Duplicate prevention and idempotent requests | Unique idempotency key, stable BullMQ job ID, guarded worker transitions | Implemented; serial and concurrent tests PASS | SMTP acceptance ambiguity remains | P0 |
 | Restart recovery | Startup scans scheduled/stale records and reconciles Redis jobs; Redis AOF enabled | Implemented; missing-job recovery test PASS | Full kill/restart with live SMTP not run | P0 |
 | Elasticsearch indexing and email search | No dependency/config/code | NOT IMPLEMENTED | Index accepted/sent records and expose search | P1 |
@@ -108,7 +119,7 @@ No dependency installation was attempted. No environment values were read. `.env
 
 ## Git and environment (current update)
 
-- **Verified at follow-up:** current directory `/home/nmit/reachinbox-scheduler`; branch `main`, HEAD `351ab28`, tracking `origin/main`; backend milestone changes are local and uncommitted.
+- **Current milestone:** repository `/home/nmit/reachinbox-scheduler`; branch `main`, base commit `ae5a478` (`feat: implement email scheduling backend`), tracking `origin/main`; current scheduling/rate-limit changes are local and uncommitted.
 - **Verified:** dependencies are installed from both lockfiles. Ignored `node_modules`, `dist`, and TypeScript build-info artifacts are present locally and excluded from Git.
 - **Verified:** root `.env` is absent and untouched; `.env.example` was extended with placeholder backend configuration. No credential values were read or written.
 - **Verified:** Node 22.23.3/npm 10.9.9 are available at `/tmp/reachinbox-toolchain` without changing system Node 18.19.1/npm 9.2.0. Docker Compose works with elevated socket access. MySQL and Redis are running with named volumes intact.
@@ -118,8 +129,8 @@ No dependency installation was attempted. No environment values were read. `.env
 ## Risks and engineering decisions
 
 - The transactional outbox closes the normal MySQL-to-Redis enqueue failure window; MySQL and Redis still cannot share one atomic transaction.
-- A Redis counter must be atomic across workers and account for window rollover; quota exhaustion must persist a future due time and avoid hot retry loops.
-- BullMQ persistence supports delayed-job recovery only if Redis persistence and job options are appropriate; verify restart behavior against actual services.
+- Redis Lua reservations are atomic across workers and use a rolling one-hour sorted set. Redis AOF/persistence is required to preserve recent quota history across restarts; loss of Redis data can reset the effective quota window.
+- BullMQ persists rate-delayed jobs; an integration test confirmed a delayed job remains delayed across worker close/restart. Startup reconciliation repairs missing jobs from MySQL scheduled rows.
 - SMTP acceptance is not confirmed delivery. Retries after uncertain SMTP outcomes can duplicate mail. Record this limitation and use stable message/job identifiers and conservative retry policy; exactly-once delivery is not guaranteed.
 - OAuth secrets and Slack tokens require secure environment configuration and protected storage. Missing Slack connections and expired/revoked tokens must not block email processing.
 - Starter Express/TypeScript dependency ranges remain `latest`; new scheduling dependencies are lockfile-backed. `npm install` reported four high-severity audit findings; no forced audit fix or broad dependency upgrade was run.
@@ -128,7 +139,7 @@ No dependency installation was attempted. No environment values were read. `.env
 ## Remaining work after backend foundation
 
 1. Configure Ethereal SMTP credentials and verify one real test send and preview link.
-2. Continue remaining assignment requirements as separate milestones: quotas/rate limiting, Slack, search/Bull Board, Google OAuth, and the frontend dashboard.
+2. Continue remaining assignment requirements as separate milestones: Slack, search/Bull Board, Google OAuth, and the frontend dashboard.
 3. Complete hosting, reviewer access, demo video, and submission after required features are implemented and verified.
 
 **Dependencies:** the local Node 22/npm 10 toolchain and MySQL/Redis are now available; Docker commands require elevated socket access here, and MySQL is mapped to host port 13306 because 3306 is occupied. An Ethereal SMTP account/configuration and agreed application environment variables are still required. Do not invent credentials.
@@ -136,8 +147,9 @@ No dependency installation was attempted. No environment values were read. `.env
 ## Manual actions needed
 
 - Configure `SMTP_USER` and `SMTP_PASS` with actual Ethereal credentials to run the worker and verify real SMTP acceptance.
+- Set `EMAIL_MIN_SEND_DELAY_MS` (milliseconds) and `SENDER_MAX_EMAILS_PER_HOUR` (rolling 60-minute default) in the environment as needed. A sender-specific `hourlyLimit` can be set on its `Sender` row; there is not yet a sender administration API.
 - Use `PATH=/tmp/reachinbox-toolchain/node_modules/.bin:$PATH` for Node 22/npm 10 in this environment; request elevated Docker access for Compose commands. MySQL is mapped to host port 13306 because 3306 is occupied.
 - Configure Google OAuth, Slack, and eventual hosting credentials securely when those later milestones begin.
 - Confirm GitHub repository privacy and reviewer invitations when ready to submit.
 
-This handoff records the verified backend foundation milestone; no frontend or later integration milestone was started.
+This handoff records the verified backend scheduling and rate-limit milestones; no frontend or unrelated integration milestone was started.

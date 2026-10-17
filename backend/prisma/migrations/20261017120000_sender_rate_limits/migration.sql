@@ -1,0 +1,2 @@
+ALTER TABLE `Sender`
+    ADD COLUMN `hourlyLimit` INTEGER UNSIGNED NULL;

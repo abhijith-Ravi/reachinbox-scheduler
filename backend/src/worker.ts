@@ -1,10 +1,12 @@
 import { Worker } from 'bullmq'
+import Redis from 'ioredis'
 import { config } from './config'
 import { ensureDefaultSender, prisma } from './db'
 import { assertSmtpConfigured, createEtherealTransport } from './email-transport'
 import { reconcileScheduledEmails } from './outbox'
 import { createEmailProcessor } from './processor'
 import { createEmailQueue, EMAIL_QUEUE_NAME, redisConnection, type EmailJobData } from './queue'
+import { SenderRateLimiter } from './rate-limit'
 
 async function main(): Promise<void> {
   assertSmtpConfigured()
@@ -12,10 +14,13 @@ async function main(): Promise<void> {
   await ensureDefaultSender()
   const emailQueue = createEmailQueue()
   await emailQueue.waitUntilReady()
+  const rateRedis = new Redis(redisConnection)
+  await rateRedis.ping()
   const recovered = await reconcileScheduledEmails(prisma, emailQueue)
   if (recovered) console.info(`Reconciled ${recovered} persisted scheduled email(s).`)
 
-  const worker = new Worker<EmailJobData>(EMAIL_QUEUE_NAME, createEmailProcessor(prisma, createEtherealTransport()), {
+  const limiter = new SenderRateLimiter(rateRedis, config.EMAIL_MIN_SEND_DELAY_MS, config.SENDER_MAX_EMAILS_PER_HOUR)
+  const worker = new Worker<EmailJobData>(EMAIL_QUEUE_NAME, createEmailProcessor(prisma, createEtherealTransport(), limiter), {
     connection: redisConnection,
     concurrency: config.WORKER_CONCURRENCY,
   })
@@ -27,6 +32,7 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     await worker.close()
     await emailQueue.close()
+    await rateRedis.quit()
     await prisma.$disconnect()
     process.exit(0)
   }

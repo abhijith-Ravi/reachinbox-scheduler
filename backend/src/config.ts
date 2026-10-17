@@ -22,6 +22,8 @@ const envSchema = z.object({
   EMAIL_MAX_ATTEMPTS: positiveInteger(3),
   EMAIL_RETRY_DELAY_MS: positiveInteger(5000),
   EMAIL_PROCESSING_STALE_MS: positiveInteger(900000),
+  EMAIL_MIN_SEND_DELAY_MS: z.coerce.number().int().nonnegative().default(1000),
+  SENDER_MAX_EMAILS_PER_HOUR: positiveInteger(100),
 })
 
 const parsed = envSchema.safeParse(process.env)

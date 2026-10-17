@@ -7,11 +7,18 @@ Backend foundation for the ReachInbox email scheduling assignment. The frontend 
 - **Express API** validates schedule requests, applies idempotency, persists an `Email` and transactional `EmailOutbox` record, and exposes email status/list endpoints.
 - **MySQL + Prisma** store sender identities, email state, SMTP acceptance metadata, and outbox state. Prisma migrations are under `backend/prisma/migrations`.
 - **BullMQ + Redis** hold delayed jobs with stable IDs derived from email IDs. The API and worker both reconcile persisted scheduled records on startup.
-- **Worker** claims an email through a conditional database transition, delivers through configured SMTP, and records `SENT` only after SMTP accepts the message. SMTP credentials are environment-only.
+- **Worker** claims an email through a conditional database transition, obtains an atomic Redis send reservation, delivers through configured SMTP, and records `SENT` only after SMTP accepts the message. SMTP credentials are environment-only.
+- **Rate coordination** uses one Redis Lua script and Redis server time to atomically check a sender's minimum interval and rolling-hour allowance across worker processes. A nullable `Sender.hourlyLimit` overrides the configured default.
 
 The SQL transaction cannot include Redis. If the API commits an email but cannot enqueue it, it leaves a pending outbox row and responds `503` with the saved email ID. Repeating the same request/key retries the enqueue; API or worker startup also scans scheduled and stale-processing rows and reconciles jobs. A crash after Redis enqueue but before the outbox update is safe to retry because the BullMQ job ID is stable. Redis should keep its configured AOF persistence enabled. Reconciliation runs at process startup and on the same-key retry; this milestone has no periodic scheduler.
 
 SMTP acceptance means the SMTP server accepted the message, not that the recipient's inbox received it. A crash after SMTP acceptance and before MySQL records `SENT` leaves an ambiguous outcome; retry can send a duplicate. Exactly-once SMTP delivery is not claimed. `SENT` and `smtpAcceptedAt` mean SMTP accepted the message.
+
+The minimum interval is measured between atomic Redis send-start reservations immediately before the worker invokes SMTP. The hourly allowance is a rolling 60-minute window of unique email IDs reserved for send; BullMQ/SMTP retries for the same email reuse its reservation while it remains in that window. This counts authorized logical sends (including a reservation followed by a worker crash), not confirmed inbox delivery. Quota or interval denial returns the BullMQ job to its persisted delayed state, leaves the database email `SCHEDULED`, and does not increment its SMTP attempt count. Different sender IDs have independent windows.
+
+An effective hourly limit of `0` disables sending for that sender. The Lua script denies every reservation without modifying quota history, and the job stays `SCHEDULED` in BullMQ with a 24-hour delay before rechecking; this avoids an immediate retry loop. A positive `Sender.hourlyLimit` resumes sending for that sender. To resume from the default, set the sender override to `null` (or a positive value) and configure a positive `SENDER_MAX_EMAILS_PER_HOUR`; environment changes require restarting the worker. A parked job is reconsidered within 24 hours after the change and worker restart, subject to its other rate limits. The global environment value is validated as positive, but the limiter fails closed if it is ever passed zero.
+
+Redis coordination is atomic within Redis, but not transactional with MySQL or SMTP. On a Redis error, the worker returns the row to `SCHEDULED` and BullMQ retries with the configured exponential backoff and bounded attempt count; if infrastructure retries exhaust, startup reconciliation restores the scheduled job after Redis is available. Redis loss or restoration from data older than its durable persistence can lose quota history, so the configured Redis AOF/persistence remains part of the rate-limit guarantee. A crash after the reservation but before SMTP conservatively consumes one slot until the rolling window expires. A crash after SMTP acceptance but before MySQL records it can still cause a duplicate on retry.
 
 ## Prerequisites and setup
 
@@ -62,6 +69,8 @@ The backend loads the repository-root `.env` when started from `backend/`. Exist
 | `EMAIL_MAX_ATTEMPTS` | No | `3` | Bounded BullMQ attempts, including the first attempt. |
 | `EMAIL_RETRY_DELAY_MS` | No | `5000` | Initial exponential retry backoff. |
 | `EMAIL_PROCESSING_STALE_MS` | No | `900000` | Age after which a processing row is reconciled if its queue job is absent/terminal. |
+| `EMAIL_MIN_SEND_DELAY_MS` | No | `1000` | Minimum milliseconds between send-start reservations for one sender; `0` disables pacing. |
+| `SENDER_MAX_EMAILS_PER_HOUR` | No | `100` | Positive default maximum unique email reservations per sender in any rolling 60-minute window. A sender's nullable `hourlyLimit` overrides it; `0` disables that sender and parks jobs for 24-hour rechecks. |
 
 ## Run the API and worker
 
@@ -133,8 +142,9 @@ The automated suite uses the configured development MySQL/Redis services and a m
 
 ## Current limitations
 
-- No authentication, sender administration API, per-sender SMTP credentials, quotas, minimum send delay, Elasticsearch, Slack, Bull Board, or frontend integration in this milestone.
+- No authentication, sender administration API, per-sender SMTP credentials, Elasticsearch, Slack, Bull Board, or frontend integration in this milestone.
 - Sender identities are stored in MySQL; `default` is seeded from environment configuration. Additional sender rows can be added through a future administrative path.
 - SMTP delivery is at-least-once under ambiguous crashes. MySQL state and SMTP acceptance cannot be committed atomically.
+- Redis rate reservations are atomic across workers but are not committed atomically with MySQL or SMTP. Redis data loss can reset recent quota history; a reservation made before a crash may conservatively use quota without an SMTP attempt.
 - Startup reconciliation and same-key retries repair pending work. If Redis is unavailable after a request commits and no same-key retry or process restart occurs, that outbox row remains pending until reconciliation runs.
 - The database stores MySQL `DATETIME(3)` values as UTC instants through JavaScript `Date`; clients should send explicit ISO offsets and responses are normalized to UTC `Z` timestamps.

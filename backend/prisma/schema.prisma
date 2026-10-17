@@ -23,6 +23,7 @@ model Sender {
   id        String   @id @db.VarChar(64)
   email     String   @db.VarChar(320)
   name      String?  @db.VarChar(191)
+  hourlyLimit Int?   @db.UnsignedInt
   createdAt DateTime @default(now()) @db.DateTime(3)
   updatedAt DateTime @updatedAt @db.DateTime(3)
   emails    Email[]
