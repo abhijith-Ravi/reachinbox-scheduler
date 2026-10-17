@@ -2,6 +2,22 @@
 
 Audit date: 2026-10-17 (Asia/Kolkata)
 
+## Backend foundation milestone update (2026-10-17)
+
+This update supersedes the initial starter-state implementation matrix and validation section below.
+
+| Area | Current implementation and actual verification |
+|---|---|
+| Database | Prisma 6.19 models `Sender`, `Email`, and `EmailOutbox`; unique idempotency/job keys and status/schedule indexes. Migration `20261017000000_initial_scheduler` is recorded as applied. Its first attempt stopped on redundant `_prisma_migrations` DDL after the three app tables had been created; that DDL was removed, all three actual table definitions were inspected, then Prisma marked the migration applied. No data or volumes were reset. `prisma validate`, `migrate status`, `migrate deploy` (no pending work), and schema diff (empty) passed against MySQL at `127.0.0.1:13306`. |
+| API | `POST /api/emails/schedule`, `GET /api/emails/scheduled`, `GET /api/emails/sent`, `GET /api/emails/:id`, and preserved `GET /health`. Integration tests cover validation, lists/details, replay/conflict, and concurrent idempotency. Compiled API health probe returned HTTP 200 with `{"status":"ok"}`. |
+| Queue and recovery | BullMQ 6 + Redis, stable job ID per Email, SQL transactional outbox, startup reconciliation in API/worker, and same-key enqueue retry. Tests covered Redis enqueue failure recovery and restoration of a missing delayed job. No cron or periodic scheduler. |
+| Worker and state | Separate worker entrypoint; configurable concurrency, capped attempts, exponential backoff, conditional transitions `SCHEDULED → PROCESSING → SENT/FAILED`, persisted attempts/errors. Mock-SMTP tests covered accepted status, duplicate job guard, and final retry failure. |
+| SMTP | Nodemailer Ethereal transport is implemented and requires credentials before worker startup. Missing-credential check produced the expected clear startup error. No credentials are configured, so real Ethereal delivery and preview URL were not verified. `SENT` means SMTP acceptance, not inbox delivery. |
+| Validation | PASS: clean backend `npm ci`, Prisma client generation/validation/migration state, typecheck/build, compiled API health, and all 7 DB/Redis integration tests. Tests use mocked SMTP and targeted cleanup; post-test SQL counts confirmed zero test email/outbox rows. |
+| Git and files | Current base commit is `351ab28`. Changes for this milestone are local and uncommitted. Frontend code was not modified. `.env` remains absent and untouched. |
+
+Known boundary: MySQL and Redis cannot share one atomic transaction. Startup reconciliation and same-key retries repair pending work; without a retry or restart, an enqueue failure can leave an outbox row pending. A crash after SMTP acceptance but before MySQL records success remains ambiguous and can lead to a duplicate on retry. Exactly-once SMTP delivery is not claimed.
+
 ## Environment validation update (2026-10-17)
 
 This follow-up supersedes the earlier blocked install/build/runtime results below. It records checks actually completed after that audit.
@@ -11,7 +27,7 @@ This follow-up supersedes the earlier blocked install/build/runtime results belo
 | System toolchain | Node v18.19.1, npm 9.2.0; Docker 29.7.2; Docker Compose v5.5.0. System Node/npm remain unchanged. |
 | Supported local toolchain | PASS: Node v22.23.3 and npm 10.9.9 installed under `/tmp/reachinbox-toolchain` and used for builds. No version manager was available. |
 | Frontend dependency install | PASS: `npm ci` from `frontend/package-lock.json`; initial Node 18/npm 9 install had engine warnings and omitted a native optional binding. Reinstall under Node 22/npm 10 succeeded; lockfile unchanged. |
-| Backend dependency install | PASS: `npm ci` from `backend/package-lock.json`; lockfile unchanged. |
+| Backend dependency install | PASS at the initial environment audit; the backend lockfile was later updated for this milestone and clean `npm ci` from the updated lockfile also passed. |
 | Frontend production build | PASS under Node 22.23.3/npm 10.9.9 (`tsc -b && vite build`; Vite 8.3.4). |
 | Backend typecheck and production build | PASS under Node 22.23.3/npm 10.9.9 (`npm run typecheck`, `npm run build`). |
 | Backend health endpoint | PASS in host context: `GET http://127.0.0.1:3000/health` returned HTTP 200 and `{"status":"ok"}`. The sandboxed network probe could not connect, so the successful check was run outside the network-restricted sandbox. Backend was stopped after the probe. |
@@ -27,7 +43,7 @@ Commands executed in this follow-up include `npm ci --no-audit --no-fund` in eac
 
 Hiring assignment: a full-stack email scheduling service with persistent delayed jobs, multiple senders, distributed rate limits, search, OAuth, Slack alerts, and a dashboard.
 
-Current tracked stack: React + TypeScript + Vite + Tailwind CSS; Express + TypeScript; Docker Compose definitions for MySQL 8.4 and Redis 7.4. No ORM, BullMQ, SMTP, Elasticsearch, OAuth, Slack, or queue dashboard dependency or implementation is present. The frontend has a single placeholder screen. The backend exposes `GET /health` and listens on port 3000. These are verified from the current tracked files; no runtime behavior was verified.
+Current stack: React + TypeScript + Vite + Tailwind CSS; Express + TypeScript; Prisma/MySQL; BullMQ/Redis; Nodemailer SMTP transport. Elasticsearch, Google OAuth, Slack, Bull Board, and dashboard functionality are not implemented. The frontend remains a placeholder. The backend exposes schedule/list/detail APIs and `GET /health`.
 
 ## Architecture and intended responsibilities
 
@@ -35,36 +51,36 @@ The current architecture is only a starter. The assignment's intended responsibi
 
 ## Requirement status matrix
 
-Legend: **Verified** means supported by current source/config inspection. Validation result **BLOCKED** means a check could not execute; **NOT IMPLEMENTED** means no implementation exists in the inspected repository. Priority: P0 = foundation/critical path, P1 = required feature, P2 = submission/release.
+Legend: **Verified** means supported by current source/config inspection. Validation result **BLOCKED** means a check could not execute; **NOT IMPLEMENTED** means no implementation exists. The backend foundation update above supersedes older entries below. Priority: P0 = foundation/critical path, P1 = required feature, P2 = submission/release.
 
 | Requirement | Current implementation evidence | Validation result | Remaining work | Priority |
 |---|---|---|---|---|
-| Node.js, TypeScript, Express backend | `backend/package.json`, `backend/src/index.ts` | Verified by inspection; typecheck/build PASS on Node 22 | Implement API with pinned compatible dependencies | P0 |
-| MySQL or PostgreSQL relational schema | Compose MySQL service runs; no schema/migrations | NOT IMPLEMENTED; MySQL runtime PASS | Design schema and migrations | P0 |
-| BullMQ backed by Redis | Compose Redis service runs; no BullMQ dependency/code | NOT IMPLEMENTED; Redis runtime PASS | Add queue and worker | P0 |
-| Ethereal SMTP delivery | No SMTP dependency/config/code | NOT IMPLEMENTED | Configure test SMTP and delivery path | P1 |
-| Persistent delayed scheduling; no cron | No scheduling code; no cron found | NOT IMPLEMENTED | Use BullMQ delayed jobs and recovery | P0 |
-| Multiple senders | No sender model or API | NOT IMPLEMENTED | Persist sender configurations and selection | P1 |
-| Configurable worker concurrency | No worker | NOT IMPLEMENTED | Add validated worker configuration | P1 |
-| Configurable minimum send delay | No worker or settings | NOT IMPLEMENTED | Enforce between sends | P1 |
-| Configurable hourly quotas | No quota configuration | NOT IMPLEMENTED | Persist and enforce per sender | P1 |
-| Atomic rate limiting across workers | No limiter code | NOT IMPLEMENTED | Redis atomic operation or DB transaction/locking | P0 |
-| Reschedule on quota exhaustion | No queue implementation | NOT IMPLEMENTED | Delay/reschedule and notify once per quota event | P1 |
-| Duplicate prevention and idempotent requests | No API/job persistence | NOT IMPLEMENTED | Idempotency keys, unique constraints, guarded transitions | P0 |
-| Restart recovery | Compose config has named data volumes; application has no queues/workers | NOT IMPLEMENTED; infrastructure runtime PASS | Test delayed-job recovery after process restart | P0 |
+| Node.js, TypeScript, Express backend | `backend/package.json`, `backend/src/` | Implemented; typecheck/build PASS on Node 22 | Continue API features as later milestones require | P0 |
+| MySQL relational schema | Prisma models and migration under `backend/prisma` | Implemented; migration applied and schema diff empty | Extend for future sender/admin needs | P0 |
+| BullMQ backed by Redis | BullMQ queue and configured Redis connection | Implemented; delayed-job integration tests PASS | Operational monitoring later | P0 |
+| Ethereal SMTP delivery | Nodemailer transport and safe config handling | Code implemented; actual delivery NOT VERIFIED (credentials absent) | Configure Ethereal and run a real test send | P1 |
+| Persistent delayed scheduling; no cron | BullMQ delayed jobs plus DB transactional outbox | Implemented; recovery tests PASS; no cron used | No current work in this slice | P0 |
+| Multiple senders | `Sender` relation and senderId in API; `default` seeded from config | Data model implemented; sender administration API NOT IMPLEMENTED | Add sender management later | P1 |
+| Configurable worker concurrency | `WORKER_CONCURRENCY` and BullMQ Worker | Implemented by code/config; compile PASS | Validate under real SMTP load later | P1 |
+| Configurable minimum send delay | No implementation | NOT IMPLEMENTED | Implement later | P1 |
+| Configurable hourly quotas | No implementation | NOT IMPLEMENTED | Implement later | P1 |
+| Atomic rate limiting across workers | No implementation | NOT IMPLEMENTED | Implement later | P0 |
+| Reschedule on quota exhaustion | No quota handling or Slack notification | NOT IMPLEMENTED | Implement later | P1 |
+| Duplicate prevention and idempotent requests | Unique idempotency key, stable BullMQ job ID, guarded worker transitions | Implemented; serial and concurrent tests PASS | SMTP acceptance ambiguity remains | P0 |
+| Restart recovery | Startup scans scheduled/stale records and reconciles Redis jobs; Redis AOF enabled | Implemented; missing-job recovery test PASS | Full kill/restart with live SMTP not run | P0 |
 | Elasticsearch indexing and email search | No dependency/config/code | NOT IMPLEMENTED | Index accepted/sent records and expose search | P1 |
 | Live Bull Board dashboard | No dependency/config/route | NOT IMPLEMENTED | Mount authenticated queue UI | P1 |
 | Real Slack OAuth and persistent connection management | No OAuth, Slack, or storage code | NOT IMPLEMENTED | OAuth flow, token storage, reconnect/disconnect | P1 |
 | Slack quota notifications | No Slack integration | NOT IMPLEMENTED | Send real alerts; handle absent/reconnecting connection safely | P1 |
-| React or Next.js with TypeScript | React + TypeScript + Vite source/config | Verified by inspection; frontend production build PASS | Implement application screens | P0 |
-| Tailwind or modern CSS | Tailwind dependency and Vite plugin configured | Verified by inspection; frontend production build PASS | Complete responsive design | P1 |
+| React or Next.js with TypeScript | React + TypeScript + Vite source/config | Present; frontend production build previously PASS | Implement application screens | P0 |
+| Tailwind or modern CSS | Tailwind dependency and Vite plugin configured | Present; frontend production build previously PASS | Complete responsive design | P1 |
 | Real Google OAuth login/logout/profile | No auth implementation | NOT IMPLEMENTED | OAuth client credentials, callback, session/logout, profile | P0 |
 | Scheduled and sent email dashboard | Placeholder `App.tsx` only | NOT IMPLEMENTED | Add data-backed views and status states | P1 |
 | Compose fields and lead upload | Placeholder only | NOT IMPLEMENTED | Subject/body, CSV/text parsing, count, schedule, delay, limit | P1 |
 | Loading/empty/success/error UI | No application states | NOT IMPLEMENTED | Add accessible async states | P1 |
 | Figma-inspired UI | Starter centered card; reference not inspected | NOT IMPLEMENTED / visual comparison not performed | Inspect reference and implement dashboard styling | P2 |
 | Private GitHub repo and reviewer invites | No repository visibility/invite evidence in local files | NOT VERIFIED | Confirm remotely; invite `mitrajit`, `Yadav036` | P2 |
-| README setup/architecture/limitations/features | README documents starter setup and current health endpoint, not full assignment | Verified partial; runtime claims unverified | Update after behavior is implemented and verified | P2 |
+| README setup/architecture/limitations/features | README now documents backend architecture, config, migration, API, tests, reliability limits | Updated for this milestone | Keep current as features are verified | P2 |
 | Demo video <=5 minutes | No artifact/evidence | NOT IMPLEMENTED | Record after stable end-to-end flow | P2 |
 | Hosted URL and submission form | No deployment configuration/evidence | NOT IMPLEMENTED | Deploy and submit when ready | P2 |
 | No fake OAuth/Slack, fabricated tests, or unsupported claims | Current code has no integrations or test claims | Verified in inspected code/docs | Keep claims tied to verified behavior | P0 |
@@ -81,7 +97,7 @@ The entries in this section describe the first audit only. For the current envir
 | Frontend build | `cd frontend && npm run build` | BLOCKED: `tsc: not found`; `frontend/node_modules` absent |
 | Backend typecheck | `cd backend && npm run typecheck` | BLOCKED: `tsc: not found`; `backend/node_modules` absent |
 | Backend production build | `cd backend && npm run build` | BLOCKED: `tsc: not found`; `backend/node_modules` absent |
-| Existing tests | Package scripts and repository file inspection | NOT IMPLEMENTED: no test script or test/spec files |
+| Existing tests | Initial audit found no tests | Superseded: 7 backend integration tests now PASS |
 | Compose syntax/config validation | `docker compose config --quiet` | PASS: configuration parsed; this does not verify services start |
 | Docker/runtime services | `docker compose ps` | BLOCKED: permission denied connecting to `/var/run/docker.sock`; no container state verified |
 | Toolchain | `node --version; npm --version; docker --version` | Node v18.19.1, npm 9.2.0, Docker 29.7.2; README requires Node 20+ and npm 10+ |
@@ -92,41 +108,36 @@ No dependency installation was attempted. No environment values were read. `.env
 
 ## Git and environment (current update)
 
-- **Verified at follow-up:** current directory `/home/nmit/reachinbox-scheduler`; branch `main`, HEAD `1e65c5b`, tracking `origin/main`; only `PROJECT_HANDOFF.md` is an untracked project file. Frontend/backend sources and lockfiles are unchanged.
+- **Verified at follow-up:** current directory `/home/nmit/reachinbox-scheduler`; branch `main`, HEAD `351ab28`, tracking `origin/main`; backend milestone changes are local and uncommitted.
 - **Verified:** dependencies are installed from both lockfiles. Ignored `node_modules`, `dist`, and TypeScript build-info artifacts are present locally and excluded from Git.
-- **Verified:** root `.env` is absent; `.env.example` remains the placeholder configuration. No credential values were read or written.
+- **Verified:** root `.env` is absent and untouched; `.env.example` was extended with placeholder backend configuration. No credential values were read or written.
 - **Verified:** Node 22.23.3/npm 10.9.9 are available at `/tmp/reachinbox-toolchain` without changing system Node 18.19.1/npm 9.2.0. Docker Compose works with elevated socket access. MySQL and Redis are running with named volumes intact.
 - **Runtime constraint:** host port 3306 is occupied, so this Compose project uses host port 13306 for MySQL. Docker API access is denied without elevation in this managed environment.
 - **Still requires setup:** Google OAuth, Ethereal SMTP, Slack OAuth, Elasticsearch, and GitHub/deployment credentials have not been configured or verified. Never put real credentials in tracked files.
 
 ## Risks and engineering decisions
 
-- There is no persistence model yet; queue payload/state and relational records must have a defined source of truth before a worker is added.
+- The transactional outbox closes the normal MySQL-to-Redis enqueue failure window; MySQL and Redis still cannot share one atomic transaction.
 - A Redis counter must be atomic across workers and account for window rollover; quota exhaustion must persist a future due time and avoid hot retry loops.
 - BullMQ persistence supports delayed-job recovery only if Redis persistence and job options are appropriate; verify restart behavior against actual services.
 - SMTP acceptance is not confirmed delivery. Retries after uncertain SMTP outcomes can duplicate mail. Record this limitation and use stable message/job identifiers and conservative retry policy; exactly-once delivery is not guaranteed.
 - OAuth secrets and Slack tokens require secure environment configuration and protected storage. Missing Slack connections and expired/revoked tokens must not block email processing.
-- `latest` dependency ranges are used in package manifests; lockfile installs and builds passed with Node 22/npm 10, but future dependency updates may change compatibility. Pinning can be addressed alongside feature implementation if reproducibility becomes a problem.
-- No tests exist, so behavior currently has no automated regression protection.
+- Starter Express/TypeScript dependency ranges remain `latest`; new scheduling dependencies are lockfile-backed. `npm install` reported four high-severity audit findings; no forced audit fix or broad dependency upgrade was run.
+- Actual SMTP delivery was not tested because no Ethereal credentials are configured. Mock transport tests cover worker state and retry behavior.
 
-## Recommended implementation order and next milestone
+## Remaining work after backend foundation
 
-1. **Completed:** establish a usable local toolchain and dependencies; frontend/backend builds pass.
-2. Implement the persistence and queue foundation with one end-to-end scheduled email path.
-3. Add quotas, sender controls, restart/idempotency guarantees, then search and Slack.
-4. Add Google OAuth and complete dashboard flows; validate against the visual reference.
-5. Finish README, private repository access, deployment, demo video, and submission.
-
-**Highest-value next milestone (approval required before implementation):** establish the minimum verifiable backend scheduling vertical slice: supported Node/npm and dependencies; relational migration for a scheduled email; Redis/BullMQ delayed job; worker using Ethereal SMTP; API to create/query a scheduled email; idempotency guard; health/readiness checks. Keep worker and API configuration explicit. This exercises the required persistence and queue foundation before adding quota complexity.
+1. Configure Ethereal SMTP credentials and verify one real test send and preview link.
+2. Continue remaining assignment requirements as separate milestones: quotas/rate limiting, Slack, search/Bull Board, Google OAuth, and the frontend dashboard.
+3. Complete hosting, reviewer access, demo video, and submission after required features are implemented and verified.
 
 **Dependencies:** the local Node 22/npm 10 toolchain and MySQL/Redis are now available; Docker commands require elevated socket access here, and MySQL is mapped to host port 13306 because 3306 is occupied. An Ethereal SMTP account/configuration and agreed application environment variables are still required. Do not invent credentials.
 
-**Acceptance criteria:** clean frontend/backend dependency install; backend typecheck/build; migration creates the schema; API accepts a valid scheduled request idempotently and rejects invalid input; delayed job survives worker/API restart; worker sends through configured Ethereal SMTP and records SMTP acceptance separately from confirmed delivery; duplicate request/job does not intentionally send a second message; status query exposes scheduled/sending/accepted/failure states; documented integration check uses real configured services and reports exact outcomes. This milestone does not claim the remaining assignment requirements are complete.
-
 ## Manual actions needed
 
-- Use `PATH=/tmp/reachinbox-toolchain/node_modules/.bin:$PATH` for Node 22/npm 10 in this environment; request elevated Docker access for Compose commands. Use `MYSQL_PORT=13306` when starting this Compose project while host port 3306 remains occupied.
-- Configure real OAuth, Ethereal, Slack, and eventual hosting credentials securely when those milestones are approved.
+- Configure `SMTP_USER` and `SMTP_PASS` with actual Ethereal credentials to run the worker and verify real SMTP acceptance.
+- Use `PATH=/tmp/reachinbox-toolchain/node_modules/.bin:$PATH` for Node 22/npm 10 in this environment; request elevated Docker access for Compose commands. MySQL is mapped to host port 13306 because 3306 is occupied.
+- Configure Google OAuth, Slack, and eventual hosting credentials securely when those later milestones begin.
 - Confirm GitHub repository privacy and reviewer invitations when ready to submit.
 
-No implementation beyond this audit and handoff has been performed. Await approval before starting the milestone above.
+This handoff records the verified backend foundation milestone; no frontend or later integration milestone was started.

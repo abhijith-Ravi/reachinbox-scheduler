@@ -1,89 +1,140 @@
 # ReachInbox Email Scheduler
 
-A minimal full-stack foundation for the ReachInbox email scheduler assignment.
+Backend foundation for the ReachInbox email scheduling assignment. The frontend remains a placeholder. This milestone provides a MySQL-backed Express API, persistent BullMQ delayed jobs on Redis, a separate worker, and Nodemailer transport for Ethereal SMTP.
 
-## Local infrastructure: MySQL and Redis
+## Architecture
 
-Milestone 2 adds only local MySQL and Redis services. The frontend and backend are not built or started by Docker Compose yet.
+- **Express API** validates schedule requests, applies idempotency, persists an `Email` and transactional `EmailOutbox` record, and exposes email status/list endpoints.
+- **MySQL + Prisma** store sender identities, email state, SMTP acceptance metadata, and outbox state. Prisma migrations are under `backend/prisma/migrations`.
+- **BullMQ + Redis** hold delayed jobs with stable IDs derived from email IDs. The API and worker both reconcile persisted scheduled records on startup.
+- **Worker** claims an email through a conditional database transition, delivers through configured SMTP, and records `SENT` only after SMTP accepts the message. SMTP credentials are environment-only.
 
-Create a local environment file from the safe example, then start both services from the repository root:
+The SQL transaction cannot include Redis. If the API commits an email but cannot enqueue it, it leaves a pending outbox row and responds `503` with the saved email ID. Repeating the same request/key retries the enqueue; API or worker startup also scans scheduled and stale-processing rows and reconciles jobs. A crash after Redis enqueue but before the outbox update is safe to retry because the BullMQ job ID is stable. Redis should keep its configured AOF persistence enabled. Reconciliation runs at process startup and on the same-key retry; this milestone has no periodic scheduler.
+
+SMTP acceptance means the SMTP server accepted the message, not that the recipient's inbox received it. A crash after SMTP acceptance and before MySQL records `SENT` leaves an ambiguous outcome; retry can send a duplicate. Exactly-once SMTP delivery is not claimed. `SENT` and `smtpAcceptedAt` mean SMTP accepted the message.
+
+## Prerequisites and setup
+
+- Node.js 22 LTS (20+ supported by the code) and npm 10+
+- Docker Compose v2 with access to the Docker daemon
+- MySQL 8.4 and Redis 7.4 (provided by the root Compose file)
+- Ethereal SMTP credentials to actually deliver test messages; API and mocked-SMTP tests do not require them
+
+From the repository root:
 
 ```sh
 cp .env.example .env
 docker compose up -d
 ```
 
-On PowerShell, use `Copy-Item .env.example .env` for the first command. The values in `.env.example` are development-only placeholders. Replace all passwords with strong, private values before any deployment; keep `.env` out of version control.
+The example maps MySQL to `127.0.0.1:13306` and Redis to `127.0.0.1:6379` for this development environment. Change `MYSQL_PORT` if that host port is occupied, and update `DATABASE_URL` to match. If the API is later run in another Compose container, use `mysql:3306` in `DATABASE_URL` and `redis` as `REDIS_HOST`. `.env.example` contains placeholders only; use private values for any shared environment. Never commit `.env`.
 
-Inspect service state and health:
+Install backend packages and apply the forward-only migration:
 
 ```sh
-docker compose ps
-docker compose logs --follow mysql redis
+cd backend
+npm ci
+npm run prisma:generate
+npm run prisma:validate
+npm run db:migrate
 ```
 
-Stop the containers while preserving data:
+`db:migrate` runs `prisma migrate deploy`; it does not reset the database. The API upserts the `default` sender row on startup from `DEFAULT_SENDER_EMAIL` and optional `DEFAULT_SENDER_NAME`.
+
+## Environment variables
+
+The backend loads the repository-root `.env` when started from `backend/`. Existing process environment values take precedence.
+
+| Variable | Required | Default / example | Purpose |
+|---|---|---|---|
+| `DATABASE_URL` | Yes | `mysql://reachinbox_dev:...@127.0.0.1:13306/reachinbox_dev` | Prisma MySQL connection. URL-encode reserved characters in credentials. |
+| `REDIS_HOST` | No | `127.0.0.1` | Redis host; use the Compose service name `redis` from another container. |
+| `REDIS_PORT` | No | `6379` | Redis port. |
+| `REDIS_PASSWORD` | No | empty | Redis password if enabled. |
+| `API_PORT` | No | `3000` | Express listen port. |
+| `DEFAULT_SENDER_EMAIL` | Yes | `hello@example.com` | Address for the seeded `default` sender. |
+| `DEFAULT_SENDER_NAME` | No | `ReachInbox Development` | Display name for the seeded sender. |
+| `SMTP_HOST` | No | `smtp.ethereal.email` | SMTP server hostname. |
+| `SMTP_PORT` | No | `587` | SMTP server port. |
+| `SMTP_USER` / `SMTP_PASS` | Worker only | empty | Ethereal credentials; worker refuses to start if either is missing. Never stored in MySQL or logged. |
+| `SMTP_SECURE` | No | `false` | Set `true` for implicit TLS, normally with port 465. |
+| `WORKER_CONCURRENCY` | No | `5` | Number of concurrent BullMQ jobs handled by the worker. |
+| `EMAIL_MAX_ATTEMPTS` | No | `3` | Bounded BullMQ attempts, including the first attempt. |
+| `EMAIL_RETRY_DELAY_MS` | No | `5000` | Initial exponential retry backoff. |
+| `EMAIL_PROCESSING_STALE_MS` | No | `900000` | Age after which a processing row is reconciled if its queue job is absent/terminal. |
+
+## Run the API and worker
+
+Run each process in a separate terminal from `backend/`:
 
 ```sh
-docker compose stop
-```
-
-Restart stopped containers:
-
-```sh
-docker compose restart
-```
-
-To remove the containers and network while preserving data, run `docker compose down`. MySQL and Redis store their data in named volumes, so it remains when containers are stopped, restarted, or recreated. **Do not run `docker compose down -v` unless you intend to permanently delete both named volumes and all database/cache data.**
-
-MySQL is published on `127.0.0.1:3306` and Redis on `127.0.0.1:6379` by default. Change `MYSQL_PORT` or `REDIS_PORT` in `.env` to use different local host ports. Redis is bound to localhost and is not exposed publicly.
-
-## Prerequisites
-
-- Node.js 20 or newer
-- npm 10 or newer
-- Docker Desktop with Docker Compose v2
-
-## Install
-
-```sh
-cd frontend && npm install
-cd ../backend && npm install
-```
-
-## Development
-
-Run each application in a separate terminal:
-
-```sh
-cd frontend && npm run dev
+npm run dev
 ```
 
 ```sh
-cd backend && npm run dev
+npm run dev:worker
 ```
 
-The frontend runs on Vite's local development URL. The backend listens on port 3000 by default and exposes `GET /health`.
-
-## Type-check and production builds
+The API can run without SMTP credentials. The worker exits with a clear configuration error until both `SMTP_USER` and `SMTP_PASS` are set. To build and run the compiled processes:
 
 ```sh
-cd frontend && npm run build
-cd ../backend && npm run typecheck && npm run build
+npm run typecheck
+npm run build
+npm start
 ```
 
-The backend production output is written to `backend/dist`; run it with `node backend/dist/index.js` from the repository root.
+In another terminal, run `npm run start:worker`. `GET /health` continues to return `{"status":"ok"}`.
 
-## Folder structure
+## Ethereal SMTP
 
-```text
-reachinbox-scheduler/
-├── frontend/          # React, Vite, TypeScript, and Tailwind CSS
-│   └── src/
-├── backend/           # Express and TypeScript API
-│   └── src/
-├── docker-compose.yml # Local MySQL and Redis services only
-├── .env.example       # Placeholder configuration only
-├── .gitignore
-└── README.md
+Create a test account at [Ethereal Email](https://ethereal.email/create), then copy its SMTP host, port, username, and password into the untracked root `.env`. Do not paste credentials into source code or API requests. Configure `DEFAULT_SENDER_EMAIL` to the sender identity to show in the test message. When available, the worker logs the Ethereal preview URL; that preview is a test mailbox link, not proof of inbox delivery.
+
+## API
+
+### Schedule an email
+
+`POST /api/emails/schedule` requires a client-generated, stable idempotency key. `scheduledAt` must be a future ISO-8601 timestamp with an explicit offset.
+
+```sh
+curl -X POST http://127.0.0.1:3000/api/emails/schedule \
+  -H 'content-type: application/json' \
+  -d '{
+    "senderId":"default",
+    "recipient":"recipient@example.com",
+    "subject":"Example subject",
+    "body":"Example email body",
+    "scheduledAt":"2030-01-01T10:00:00Z",
+    "idempotencyKey":"campaign-42-recipient-1"
+  }'
 ```
+
+A new schedule returns `202` with `{ "data": { "id": "...", "status": "SCHEDULED", ... }, "idempotentReplay": false }`. Repeating the identical request/key returns `200` and the same record. Reusing a key with a different payload returns `409 IDEMPOTENCY_CONFLICT`. Invalid input/past times return `400`; unknown senders return `404`; a saved record whose queue enqueue failed returns `503 QUEUE_UNAVAILABLE` and can be retried using the same key.
+
+### Read email state
+
+- `GET /api/emails/scheduled?limit=25&cursor=<email-id>` returns scheduled and processing records.
+- `GET /api/emails/sent?limit=25&cursor=<email-id>` returns records accepted by SMTP.
+- `GET /api/emails/:id` returns one email and its status, attempt count, last error, and SMTP acceptance metadata.
+
+List responses contain `data` and `pagination: { limit, nextCursor }`. `nextCursor` is `null` when there is no next page. Error responses use `{ "error": { "code": "...", "message": "..." } }`.
+
+## Tests and validation
+
+With MySQL migrated and Redis running, from `backend/`:
+
+```sh
+npm run prisma:validate
+npm run typecheck
+npm run build
+npm test
+```
+
+The automated suite uses the configured development MySQL/Redis services and a mocked SMTP transport; it creates uniquely keyed test records and cleans up those records/jobs. It does not send email. To check actual Ethereal delivery, configure credentials and a future schedule, start the API and worker, then inspect the returned email record and Ethereal preview link.
+
+## Current limitations
+
+- No authentication, sender administration API, per-sender SMTP credentials, quotas, minimum send delay, Elasticsearch, Slack, Bull Board, or frontend integration in this milestone.
+- Sender identities are stored in MySQL; `default` is seeded from environment configuration. Additional sender rows can be added through a future administrative path.
+- SMTP delivery is at-least-once under ambiguous crashes. MySQL state and SMTP acceptance cannot be committed atomically.
+- Startup reconciliation and same-key retries repair pending work. If Redis is unavailable after a request commits and no same-key retry or process restart occurs, that outbox row remains pending until reconciliation runs.
+- The database stores MySQL `DATETIME(3)` values as UTC instants through JavaScript `Date`; clients should send explicit ISO offsets and responses are normalized to UTC `Z` timestamps.

@@ -1,0 +1,67 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum EmailStatus {
+  SCHEDULED
+  PROCESSING
+  SENT
+  FAILED
+}
+
+enum OutboxStatus {
+  PENDING
+  ENQUEUED
+}
+
+model Sender {
+  id        String   @id @db.VarChar(64)
+  email     String   @db.VarChar(320)
+  name      String?  @db.VarChar(191)
+  createdAt DateTime @default(now()) @db.DateTime(3)
+  updatedAt DateTime @updatedAt @db.DateTime(3)
+  emails    Email[]
+}
+
+model Email {
+  id                  String      @id @default(cuid()) @db.VarChar(191)
+  idempotencyKey      String      @unique @db.VarChar(191)
+  senderId            String      @db.VarChar(64)
+  recipient           String      @db.VarChar(320)
+  subject             String      @db.VarChar(998)
+  body                String      @db.LongText
+  scheduledAt         DateTime    @db.DateTime(3)
+  status              EmailStatus @default(SCHEDULED)
+  bullmqJobId         String?     @unique @db.VarChar(191)
+  attemptCount        Int         @default(0)
+  lastError           String?     @db.Text
+  smtpAcceptedAt      DateTime?   @db.DateTime(3)
+  smtpMessageId       String?     @db.VarChar(998)
+  processingStartedAt DateTime?   @db.DateTime(3)
+  createdAt           DateTime    @default(now()) @db.DateTime(3)
+  updatedAt           DateTime    @updatedAt @db.DateTime(3)
+  sender              Sender      @relation(fields: [senderId], references: [id], onDelete: Restrict)
+  outbox              EmailOutbox?
+
+  @@index([status, scheduledAt])
+  @@index([senderId, createdAt])
+}
+
+model EmailOutbox {
+  id           String       @id @default(cuid()) @db.VarChar(191)
+  emailId      String       @unique @db.VarChar(191)
+  status       OutboxStatus @default(PENDING)
+  attemptCount Int          @default(0)
+  lastError    String?      @db.Text
+  enqueuedAt   DateTime?    @db.DateTime(3)
+  createdAt    DateTime     @default(now()) @db.DateTime(3)
+  updatedAt    DateTime     @updatedAt @db.DateTime(3)
+  email        Email        @relation(fields: [emailId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+}
