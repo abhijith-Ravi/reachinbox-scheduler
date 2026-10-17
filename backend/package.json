@@ -16,6 +16,9 @@
     "start:worker": "node dist/src/worker.js"
   },
   "dependencies": {
+    "@bull-board/api": "9.10.4",
+    "@bull-board/express": "9.10.4",
+    "@elastic/elasticsearch": "8.19.2",
     "@prisma/client": "6.19.0",
     "bullmq": "6.3.16",
     "dotenv": "18.0.8",

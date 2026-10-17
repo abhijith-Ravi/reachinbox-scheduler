@@ -1,12 +1,17 @@
 import express, { type ErrorRequestHandler, type Request, type Response } from 'express'
 import { timingSafeEqual } from 'node:crypto'
+import { createBullBoard } from '@bull-board/api'
+import { BullMQAdapter } from '@bull-board/api/bullMQAdapter'
+import { ExpressAdapter } from '@bull-board/express'
 import type { Queue } from 'bullmq'
+import type { Client } from '@elastic/elasticsearch'
 import { PrismaClient } from '@prisma/client'
 import { z } from 'zod'
 import { findOrCreateEmail, IdempotencyConflictError, SenderNotFoundError } from './scheduling'
 import { SlackIntegration, SlackOAuthError } from './slack-integration'
 import { listFailedNotifications, NotificationNotFoundError, NotificationStateError, replayFailedNotification } from './slack-notifications'
 import type { SlackNotificationJobData } from './slack-queue'
+import { SearchUnavailableError, searchEmails } from './email-search'
 
 const scheduleSchema = z.object({
   senderId: z.string().min(1).max(64).default('default'),
@@ -22,6 +27,14 @@ const paginationSchema = z.object({
   cursor: z.string().optional(),
 })
 
+const searchSchema = z.object({
+  q: z.string().trim().min(1).max(200).optional(),
+  status: z.enum(['SCHEDULED', 'PROCESSING', 'SENT', 'FAILED']).optional(),
+  senderId: z.string().min(1).max(64).optional(),
+  page: z.coerce.number().int().min(1).max(1000).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+}).strict().refine((value) => (value.page - 1) * value.pageSize < 10_000, { message: 'page and pageSize exceed the maximum search window.' })
+
 type EnqueueEmail = (emailId: string) => Promise<void>
 interface AppDependencies {
   prisma: PrismaClient
@@ -29,12 +42,29 @@ interface AppDependencies {
   slack?: SlackIntegration
   slackManagementToken?: string
   slackNotificationQueue?: Queue<SlackNotificationJobData>
+  bullBoardQueues?: Queue[]
+  bullBoardToken?: string
+  elasticsearch?: Client | null
 }
 
 export function createApp(dependencies: AppDependencies) {
   const app = express()
   app.disable('x-powered-by')
   app.use(express.json({ limit: '1mb' }))
+
+  const dashboardAdapter = dependencies.bullBoardQueues?.length
+    ? new ExpressAdapter()
+    : undefined
+  if (dashboardAdapter && dependencies.bullBoardQueues) {
+    dashboardAdapter.setBasePath('/admin/queues')
+    createBullBoard({ queues: dependencies.bullBoardQueues.map((queue) => new BullMQAdapter(queue)), serverAdapter: dashboardAdapter })
+  }
+
+  app.use('/admin/queues', (request, response, next) => {
+    if (!dashboardAdapter) return apiError(response, 503, 'QUEUE_DASHBOARD_UNAVAILABLE', 'The queue dashboard is not configured.')
+    if (!authorizedBearer(request.get('authorization'), dependencies.bullBoardToken)) return apiError(response, 401, 'QUEUE_DASHBOARD_UNAUTHORIZED', 'Queue dashboard authorization is required.')
+    return next()
+  }, dashboardAdapter?.getRouter() ?? ((_request, response) => apiError(response, 503, 'QUEUE_DASHBOARD_UNAVAILABLE', 'The queue dashboard is not configured.')))
 
   app.get('/health', (_request, response) => response.status(200).json({ status: 'ok' }))
 
@@ -120,6 +150,18 @@ export function createApp(dependencies: AppDependencies) {
     }
   })
 
+  app.get('/api/emails/search', async (request, response) => {
+    const parsed = searchSchema.safeParse(request.query)
+    if (!parsed.success) return apiError(response, 400, 'VALIDATION_ERROR', 'Search parameters are invalid; use q up to 200 characters, a valid status/senderId, page 1–1000, and pageSize 1–100 within the 10,000-result window.')
+    try {
+      const data = await searchEmails(dependencies.elasticsearch ?? null, parsed.data)
+      return response.json({ data: data.data, pagination: data.pagination })
+    } catch (error) {
+      if (error instanceof SearchUnavailableError) return apiError(response, 503, 'SEARCH_UNAVAILABLE', 'Email search is not configured.')
+      return apiError(response, 503, 'SEARCH_UNAVAILABLE', 'Email search is temporarily unavailable.')
+    }
+  })
+
   app.get('/api/emails/scheduled', async (request, response) => {
     const pagination = parsePagination(request, response)
     if (!pagination) return
@@ -164,6 +206,10 @@ export function createApp(dependencies: AppDependencies) {
 }
 
 function authorizedSlackManagement(header: string | undefined, expected: string | undefined): boolean {
+  return authorizedBearer(header, expected)
+}
+
+function authorizedBearer(header: string | undefined, expected: string | undefined): boolean {
   if (!header || !expected?.length || !header.startsWith('Bearer ')) return false
   const supplied = Buffer.from(header.slice(7))
   const configured = Buffer.from(expected)

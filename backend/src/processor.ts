@@ -5,6 +5,7 @@ import type { EmailTransport } from './email-transport'
 import type { EmailJobData } from './queue'
 import type { SenderRateLimiter } from './rate-limit'
 import type { QuotaNotificationInput } from './slack-notifications'
+import { updateEmailWithSearchOutbox } from './email-search'
 
 export function createEmailProcessor(
   db: PrismaClient,
@@ -15,9 +16,7 @@ export function createEmailProcessor(
   return async (job: Job<EmailJobData>): Promise<void> => {
     const maxAttempts = job.opts.attempts ?? config.EMAIL_MAX_ATTEMPTS
     const staleBefore = new Date(Date.now() - config.EMAIL_PROCESSING_STALE_MS)
-    const claimed = await db.email.updateMany({
-      where: {
-        id: job.data.emailId,
+    const claimed = await updateEmailWithSearchOutbox(db, job.data.emailId, {
         attemptCount: { lt: maxAttempts },
         OR: [
           { status: 'SCHEDULED' },
@@ -25,18 +24,13 @@ export function createEmailProcessor(
           { status: 'PROCESSING', processingStartedAt: null },
           ...(job.attemptsMade > 0 ? [{ status: 'PROCESSING' as const }] : []),
         ],
-      },
-      data: { status: 'PROCESSING', processingStartedAt: new Date(), lastError: null },
-    })
+      }, { status: 'PROCESSING', processingStartedAt: new Date(), lastError: null })
 
-    if (claimed.count === 0) {
+    if (claimed === 0) {
       const current = await db.email.findUnique({ where: { id: job.data.emailId }, select: { status: true, attemptCount: true } })
       if (current?.status === 'SENT' || current?.status === 'FAILED') return
       if (current && current.attemptCount >= maxAttempts) {
-        await db.email.updateMany({
-          where: { id: job.data.emailId, status: { in: ['SCHEDULED', 'PROCESSING'] } },
-          data: { status: 'FAILED', processingStartedAt: null, lastError: 'Maximum email delivery attempts exhausted.' },
-        })
+        await updateEmailWithSearchOutbox(db, job.data.emailId, { status: { in: ['SCHEDULED', 'PROCESSING'] } }, { status: 'FAILED', processingStartedAt: null, lastError: 'Maximum email delivery attempts exhausted.' })
         return
       }
       throw new Error('Email is already being processed; BullMQ will retry after the active attempt settles.')
@@ -49,18 +43,12 @@ export function createEmailProcessor(
     try {
       permit = await limiter.reserve(email.senderId, email.id, email.sender.hourlyLimit)
     } catch (error) {
-      await db.email.updateMany({
-        where: { id: email.id, status: 'PROCESSING' },
-        data: { status: 'SCHEDULED', processingStartedAt: null, lastError: `Redis send coordination failed: ${errorMessage(error)}` },
-      })
+      await updateEmailWithSearchOutbox(db, email.id, { status: 'PROCESSING' }, { status: 'SCHEDULED', processingStartedAt: null, lastError: `Redis send coordination failed: ${errorMessage(error)}` })
       throw error
     }
 
     if (!permit.allowed) {
-      await db.email.updateMany({
-        where: { id: email.id, status: 'PROCESSING' },
-        data: { status: 'SCHEDULED', processingStartedAt: null },
-      })
+      await updateEmailWithSearchOutbox(db, email.id, { status: 'PROCESSING' }, { status: 'SCHEDULED', processingStartedAt: null })
       if (onQuotaLimited && permit.notificationPeriod
         && (permit.reason === 'hourly_limit' || permit.reason === 'disabled')) {
         try {
@@ -82,12 +70,9 @@ export function createEmailProcessor(
       throw new DelayedError()
     }
 
-    const started = await db.email.updateMany({
-      where: { id: email.id, status: 'PROCESSING', attemptCount: { lt: maxAttempts } },
-      data: { attemptCount: { increment: 1 }, lastError: null },
-    })
-    if (started.count !== 1) {
-      await db.email.updateMany({ where: { id: email.id, status: 'PROCESSING' }, data: { status: 'FAILED', processingStartedAt: null, lastError: 'Maximum email delivery attempts exhausted.' } })
+    const started = await updateEmailWithSearchOutbox(db, email.id, { status: 'PROCESSING', attemptCount: { lt: maxAttempts } }, { attemptCount: { increment: 1 }, lastError: null })
+    if (started !== 1) {
+      await updateEmailWithSearchOutbox(db, email.id, { status: 'PROCESSING' }, { status: 'FAILED', processingStartedAt: null, lastError: 'Maximum email delivery attempts exhausted.' })
       return
     }
     const attemptNumber = email.attemptCount + 1
@@ -99,26 +84,20 @@ export function createEmailProcessor(
         subject: email.subject,
         text: email.body,
       })
-      const completed = await db.email.updateMany({
-        where: { id: email.id, status: 'PROCESSING' },
-        data: {
+      const completed = await updateEmailWithSearchOutbox(db, email.id, { status: 'PROCESSING' }, {
           status: 'SENT',
           smtpAcceptedAt: new Date(),
           smtpMessageId: accepted.messageId,
           processingStartedAt: null,
           lastError: null,
-        },
       })
-      if (completed.count !== 1) throw new Error('Email state changed before SMTP acceptance could be recorded.')
+      if (completed !== 1) throw new Error('Email state changed before SMTP acceptance could be recorded.')
     } catch (error) {
       const message = errorMessage(error)
-      await db.email.updateMany({
-        where: { id: email.id, status: 'PROCESSING' },
-        data: {
+      await updateEmailWithSearchOutbox(db, email.id, { status: 'PROCESSING' }, {
           status: attemptNumber >= maxAttempts ? 'FAILED' : 'SCHEDULED',
           processingStartedAt: null,
           lastError: message,
-        },
       })
       throw error
     }

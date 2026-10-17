@@ -1,4 +1,5 @@
 import { Prisma, type PrismaClient } from '@prisma/client'
+import { queueInitialEmailSearchInTransaction } from './email-search'
 
 export interface ScheduleInput {
   senderId: string
@@ -46,6 +47,7 @@ export async function findOrCreateEmail(db: PrismaClient, input: ScheduleInput) 
         include: { sender: true },
       })
       await tx.emailOutbox.create({ data: { emailId: created.id } })
+      await queueInitialEmailSearchInTransaction(tx, created.id, created.searchVersion)
       return created
     })
     return { email, created: true }

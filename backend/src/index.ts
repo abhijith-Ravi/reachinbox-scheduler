@@ -6,6 +6,7 @@ import { createEmailQueue, redisConnection } from './queue'
 import { enqueueEmailById, reconcileScheduledEmails } from './outbox'
 import { SlackIntegration } from './slack-integration'
 import { createSlackNotificationQueue } from './slack-queue'
+import { createElasticsearchClient } from './email-search'
 
 async function main(): Promise<void> {
   await prisma.$connect()
@@ -16,6 +17,7 @@ async function main(): Promise<void> {
   await slackNotificationQueue.waitUntilReady()
   const slackRedis = new Redis(redisConnection)
   await slackRedis.ping()
+  const elasticsearch = createElasticsearchClient()
   const recovered = await reconcileScheduledEmails(prisma, queue)
   if (recovered) console.info(`Reconciled ${recovered} persisted scheduled email(s).`)
 
@@ -25,6 +27,9 @@ async function main(): Promise<void> {
     slack: new SlackIntegration(prisma, slackRedis, config),
     slackManagementToken: config.SLACK_MANAGEMENT_TOKEN,
     slackNotificationQueue,
+    bullBoardQueues: [queue, slackNotificationQueue],
+    bullBoardToken: config.BULL_BOARD_TOKEN,
+    elasticsearch,
   })
   const server = app.listen(config.API_PORT, () => console.info(`ReachInbox API listening on port ${config.API_PORT}`))
 
@@ -33,6 +38,7 @@ async function main(): Promise<void> {
     await queue.close()
     await slackNotificationQueue.close()
     await slackRedis.quit()
+    await elasticsearch?.close()
     await prisma.$disconnect()
     process.exit(0)
   }

@@ -30,6 +30,14 @@ const envSchema = z.object({
   SLACK_REDIRECT_URL: z.preprocess((value) => value === '' ? undefined : value, z.url().refine((value) => new URL(value).protocol === 'https:', 'SLACK_REDIRECT_URL must use HTTPS').optional()),
   SLACK_TOKEN_ENCRYPTION_KEY: z.preprocess((value) => value === '' ? undefined : value, z.string().regex(/^[a-fA-F0-9]{64}$/, 'SLACK_TOKEN_ENCRYPTION_KEY must be 64 hexadecimal characters').optional()),
   SLACK_MANAGEMENT_TOKEN: z.preprocess((value) => value === '' ? undefined : value, z.string().min(32).optional()),
+  ELASTICSEARCH_URL: z.preprocess((value) => value === '' ? undefined : value, z.url().refine((value) => ['http:', 'https:'].includes(new URL(value).protocol), 'ELASTICSEARCH_URL must use HTTP or HTTPS').optional()),
+  ELASTICSEARCH_USERNAME: optionalNonEmpty,
+  ELASTICSEARCH_PASSWORD: optionalNonEmpty,
+  BULL_BOARD_TOKEN: z.preprocess((value) => value === '' ? undefined : value, z.string().min(32).optional()),
+}).superRefine((values, context) => {
+  if (Boolean(values.ELASTICSEARCH_USERNAME) !== Boolean(values.ELASTICSEARCH_PASSWORD)) {
+    context.addIssue({ code: 'custom', path: ['ELASTICSEARCH_USERNAME'], message: 'ELASTICSEARCH_USERNAME and ELASTICSEARCH_PASSWORD must be set together' })
+  }
 })
 
 const parsed = envSchema.safeParse(process.env)

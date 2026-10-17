@@ -9,6 +9,8 @@ Backend foundation for the ReachInbox email scheduling assignment. The frontend 
 - **BullMQ + Redis** hold delayed jobs with stable IDs derived from email IDs. The API and worker both reconcile persisted scheduled records on startup.
 - **Worker** claims an email through a conditional database transition, obtains an atomic Redis send reservation, delivers through configured SMTP, and records `SENT` only after SMTP accepts the message. SMTP credentials are environment-only.
 - **Rate coordination** uses one Redis Lua script and Redis server time to atomically check a sender's minimum interval and rolling-hour allowance across worker processes. A nullable `Sender.hourlyLimit` overrides the configured default.
+- **Email search** uses a versioned MySQL outbox and Elasticsearch document IDs derived from email IDs. A separate worker reconciler indexes changes without blocking email delivery.
+- **Queue monitoring** uses Bull Board for the existing email and Slack queues, protected with a dedicated environment token.
 
 The SQL transaction cannot include Redis. If the API commits an email but cannot enqueue it, it leaves a pending outbox row and responds `503` with the saved email ID. Repeating the same request/key retries the enqueue; API or worker startup also scans scheduled and stale-processing rows and reconciles jobs. A crash after Redis enqueue but before the outbox update is safe to retry because the BullMQ job ID is stable. Redis should keep its configured AOF persistence enabled. Email schedule reconciliation runs at process startup and on the same-key retry; recurring Slack-notification recovery is described below.
 
@@ -20,6 +22,54 @@ An effective hourly limit of `0` disables sending for that sender. The Lua scrip
 
 Redis coordination is atomic within Redis, but not transactional with MySQL or SMTP. On a Redis error, the worker returns the row to `SCHEDULED` and BullMQ retries with the configured exponential backoff and bounded attempt count; if infrastructure retries exhaust, startup reconciliation restores the scheduled job after Redis is available. Redis loss or restoration from data older than its durable persistence can lose quota history, so the configured Redis AOF/persistence remains part of the rate-limit guarantee. A crash after the reservation but before SMTP conservatively consumes one slot until the rolling window expires. A crash after SMTP acceptance but before MySQL records it can still cause a duplicate on retry.
 
+## Elasticsearch email search
+
+The root Compose file adds Elasticsearch `8.19.23` on `127.0.0.1:9200`, with a persistent `elasticsearch_data` volume and a health check. This **local development service only** disables Elasticsearch security and is bound to loopback; do not reuse that setting in production. Allocate at least 4 GB to Docker (the service is capped at 2 GB and uses a 1 GB JVM heap). Start the existing services and the new search service with:
+
+```sh
+docker compose up -d mysql redis elasticsearch
+docker compose ps
+```
+
+If host port 3306 is occupied, use the existing development override and apply it consistently to later Compose commands: `MYSQL_PORT=13306 docker compose up -d mysql`. The named MySQL and Redis volumes remain in place. Run the additive migration with `cd backend && npm run db:migrate`; it adds `Email.searchVersion` and `EmailSearchOutbox` and queues existing database emails for initial indexing. It does not reset or recreate the database.
+
+Configure the backend in the root `.env` (the values are optional, and the API starts without Elasticsearch):
+
+```dotenv
+ELASTICSEARCH_URL=http://127.0.0.1:9200
+ELASTICSEARCH_USERNAME=
+ELASTICSEARCH_PASSWORD=
+```
+
+For production, use an HTTPS cluster with authentication and a trusted TLS certificate; do not disable Elasticsearch security. The client uses system trusted roots and a five-second request timeout. Never put credentials in source control.
+
+The index `reachinbox-emails-v1` has explicit mappings: `id`, `senderId`, `recipient`, and `status` are exact-match fields; `subject` has full-text and exact subfields; `body` is full-text; and schedule/acceptance/created/updated fields are dates. All email states (`SCHEDULED`, `PROCESSING`, `SENT`, `FAILED`) are indexed. Search text matches subject and body, with subject weighted higher. Results include sender ID, recipient, subject, status, and timestamps, but omit the body and internal SMTP/queue metadata.
+
+The search endpoint supports `q`, `status`, `senderId`, `page`, and `pageSize`:
+
+```sh
+curl 'http://127.0.0.1:3000/api/emails/search?q=meeting&status=SENT&senderId=default&page=1&pageSize=20'
+```
+
+`pageSize` is 1–100; offsets are limited to the first 10,000 matches. The response contains `data` and `pagination: { page, pageSize, total, totalPages }`. Invalid parameters return `400`; an unconfigured or unavailable Elasticsearch cluster returns `503 SEARCH_UNAVAILABLE`. Existing MySQL-backed listing and detail endpoints remain available. Search is unauthenticated like the existing email API and is **not production-ready for multi-tenant data** until application authentication and authorization are added.
+
+Each app-controlled email create/update increments `searchVersion` and inserts an outbox row in the same MySQL transaction. The migration backfills existing rows. The worker scans up to 50 events every 5 seconds and on startup, uses a 60-second database lease for concurrent workers, and retries with exponential backoff from 5 seconds to a one-hour cap. Attempt counts cap at 12 while transient events remain pending and continue retrying at the capped interval. It reads the latest MySQL row before writing and uses Elasticsearch external versioning with the stable email ID, so delayed older work cannot overwrite a newer state. Duplicate index writes are safe. Elasticsearch downtime never blocks scheduling or SMTP; it leaves durable pending rows and search may lag until recovery. MySQL and Elasticsearch do not share a transaction.
+
+Recipient addresses and complete email bodies are personal/sensitive data indexed in Elasticsearch so body search can work. Results omit the body, but Elasticsearch administrators can access indexed documents. Apply production access controls, retention, backups, encryption, and deletion policies appropriate for that data.
+
+## Bull Board queue dashboard
+
+Set `BULL_BOARD_TOKEN` in the root `.env` to a unique random token of at least 32 characters. The dashboard is served at `/admin/queues` and covers `scheduled-emails` and `slack-notifications`; search indexing uses the MySQL outbox poller and adds no BullMQ queue. All dashboard pages and API requests require `Authorization: Bearer $BULL_BOARD_TOKEN`; invalid or missing values return `401`. Keep this admin route behind HTTPS and trusted network access. The bearer token grants queue visibility and Bull Board's queue actions; it is separate from `SLACK_MANAGEMENT_TOKEN`.
+
+Example dashboard API request:
+
+```sh
+curl -H "Authorization: Bearer $BULL_BOARD_TOKEN" \
+  http://127.0.0.1:3000/admin/queues/api/queues
+```
+
+No authenticated application user system exists yet, so the token is deployment-wide administrative access, not per-user authorization.
+
 ## Prerequisites and setup
 
 - Node.js 22 LTS (20+ supported by the code) and npm 10+
@@ -30,7 +80,7 @@ Redis coordination is atomic within Redis, but not transactional with MySQL or S
 From the repository root:
 
 ```sh
-cp .env.example .env
+if [ ! -f .env ]; then cp .env.example .env; fi
 docker compose up -d
 ```
 
@@ -71,6 +121,9 @@ The backend loads the repository-root `.env` when started from `backend/`. Exist
 | `EMAIL_PROCESSING_STALE_MS` | No | `900000` | Age after which a processing row is reconciled if its queue job is absent/terminal. |
 | `EMAIL_MIN_SEND_DELAY_MS` | No | `1000` | Minimum milliseconds between send-start reservations for one sender; `0` disables pacing. |
 | `SENDER_MAX_EMAILS_PER_HOUR` | No | `100` | Positive default maximum unique email reservations per sender in any rolling 60-minute window. A sender's nullable `hourlyLimit` overrides it; `0` disables that sender and parks jobs for 24-hour rechecks. |
+| `ELASTICSEARCH_URL` | No | `http://127.0.0.1:9200` | Elasticsearch HTTP(S) endpoint. If unset, email indexing pauses and search returns `503`. |
+| `ELASTICSEARCH_USERNAME` / `ELASTICSEARCH_PASSWORD` | No | empty | Optional paired credentials for secured Elasticsearch deployments. |
+| `BULL_BOARD_TOKEN` | No | empty | At least 32 random characters; protects `/admin/queues` with Bearer authentication. |
 
 ## Run the API and worker
 
@@ -184,9 +237,13 @@ Replay accepts only `FAILED` events and returns `202`; unknown IDs return `404`,
 
 The backend suite includes Redis-backed state expiry/single-use tests and mocked Slack HTTP exchange/delivery tests. They validate application behavior but do not prove live Slack credentials, workspace installation, or real message delivery.
 
+## Current validation results (2026-10-17)
+
+Using Node.js 22.23.3/npm 10.9.9 from a temporary toolchain under `/tmp`, Prisma client generation, schema validation, migration status, backend typecheck, production build, Compose configuration validation, `git diff --check`, and the complete backend suite passed. The database reports all five migrations applied. The suite reports 39 passed, 0 failed, and 1 skipped: 19 scheduler tests use MySQL/Redis, the search tests use MySQL and a mocked Elasticsearch client (with Redis for Bull Board), and the Slack tests use MySQL/Redis with Slack HTTP mocked. The live Elasticsearch round-trip was not verified. The container is currently unhealthy because Elasticsearch's 90% disk watermark is exceeded and its primary shard is unassigned; search functionality needs to be rechecked after disk headroom is restored. No live Slack OAuth/message delivery or SMTP delivery was tested.
+
 ## Current limitations
 
-- No application user authentication, sender administration API, per-sender SMTP credentials, Elasticsearch, Bull Board, or frontend integration.
+- No application user authentication, sender administration API, per-sender SMTP credentials, or frontend integration. Search and Bull Board are deployment-wide backend features, not tenant-isolated UI features.
 - Sender identities are stored in MySQL; `default` is seeded from environment configuration. Additional sender rows can be added through a future administrative path.
 - SMTP delivery is at-least-once under ambiguous crashes. MySQL state and SMTP acceptance cannot be committed atomically.
 - Redis rate reservations are atomic across workers but are not committed atomically with MySQL or SMTP. Redis data loss can reset recent quota history; a reservation made before a crash may conservatively use quota without an SMTP attempt.

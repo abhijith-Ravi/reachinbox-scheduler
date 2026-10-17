@@ -9,6 +9,7 @@ import { createEmailQueue, EMAIL_QUEUE_NAME, redisConnection, type EmailJobData 
 import { SenderRateLimiter } from './rate-limit'
 import { createSlackNotificationQueue } from './slack-queue'
 import { createSlackNotificationWorker, enqueueQuotaNotification, reconcileSlackNotifications, startSlackNotificationReconciler } from './slack-notifications'
+import { createElasticsearchClient, startEmailSearchReconciler } from './email-search'
 
 async function main(): Promise<void> {
   assertSmtpConfigured()
@@ -22,6 +23,8 @@ async function main(): Promise<void> {
   if (recovered) console.info(`Reconciled ${recovered} persisted scheduled email(s).`)
 
   const limiter = new SenderRateLimiter(rateRedis, config.EMAIL_MIN_SEND_DELAY_MS, config.SENDER_MAX_EMAILS_PER_HOUR)
+  const elasticsearch = createElasticsearchClient()
+  const searchReconciler = elasticsearch ? startEmailSearchReconciler(prisma, elasticsearch) : undefined
   const slackQueue = createSlackNotificationQueue()
   await slackQueue.waitUntilReady()
   let slackWorker: ReturnType<typeof createSlackNotificationWorker> | undefined
@@ -52,6 +55,8 @@ async function main(): Promise<void> {
 
   const shutdown = async () => {
     await worker.close()
+    await searchReconciler?.close()
+    await elasticsearch?.close()
     await slackReconciler?.close()
     await slackWorker?.close()
     await slackQueue.close()

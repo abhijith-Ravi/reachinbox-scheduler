@@ -31,6 +31,12 @@ enum SlackNotificationStatus {
   SKIPPED
 }
 
+enum SearchIndexStatus {
+  PENDING
+  PROCESSING
+  INDEXED
+}
+
 model Sender {
   id        String   @id @db.VarChar(64)
   email     String   @db.VarChar(320)
@@ -56,13 +62,34 @@ model Email {
   smtpAcceptedAt      DateTime?   @db.DateTime(3)
   smtpMessageId       String?     @db.VarChar(998)
   processingStartedAt DateTime?   @db.DateTime(3)
+  searchVersion       BigInt      @default(1) @db.UnsignedBigInt
   createdAt           DateTime    @default(now()) @db.DateTime(3)
   updatedAt           DateTime    @updatedAt @db.DateTime(3)
   sender              Sender      @relation(fields: [senderId], references: [id], onDelete: Restrict)
   outbox              EmailOutbox?
+  searchOutbox        EmailSearchOutbox[]
 
   @@index([status, scheduledAt])
   @@index([senderId, createdAt])
+}
+
+model EmailSearchOutbox {
+  id            String           @id @default(cuid()) @db.VarChar(191)
+  emailId       String           @db.VarChar(191)
+  version       BigInt           @db.UnsignedBigInt
+  status        SearchIndexStatus @default(PENDING)
+  attemptCount  Int              @default(0)
+  nextAttemptAt DateTime         @default(now()) @db.DateTime(3)
+  leaseExpiresAt DateTime?       @db.DateTime(3)
+  lastError     String?          @db.VarChar(500)
+  indexedAt     DateTime?        @db.DateTime(3)
+  createdAt     DateTime         @default(now()) @db.DateTime(3)
+  updatedAt     DateTime         @updatedAt @db.DateTime(3)
+  email         Email            @relation(fields: [emailId], references: [id], onDelete: Cascade)
+
+  @@unique([emailId, version])
+  @@index([status, nextAttemptAt])
+  @@index([status, leaseExpiresAt])
 }
 
 model EmailOutbox {
