@@ -1,6 +1,6 @@
 # ReachInbox Email Scheduler
 
-Backend foundation for the ReachInbox email scheduling assignment. The frontend remains a placeholder. This milestone provides a MySQL-backed Express API, persistent BullMQ delayed jobs on Redis, a separate worker, and Nodemailer transport for Ethereal SMTP.
+ReachInbox email scheduling assignment with a React/TypeScript dashboard and a MySQL-backed Express API. BullMQ delayed jobs run on Redis with a separate worker and Nodemailer transport for Ethereal SMTP.
 
 ## Architecture
 
@@ -69,6 +69,22 @@ curl -H "Authorization: Bearer $BULL_BOARD_TOKEN" \
 ```
 
 No authenticated application user system exists yet, so the token is deployment-wide administrative access, not per-user authorization.
+
+## Frontend dashboard
+
+The React dashboard reads scheduled and sent emails from `GET /api/emails/scheduled` and `GET /api/emails/sent`, using the backend's `limit`/`cursor` pagination response. The compose dialog accepts recipient addresses as text or CSV, reports valid/invalid/duplicate addresses, and submits one request per recipient to the existing `POST /api/emails/schedule` contract. Each request sends `senderId`, `recipient`, `subject`, `body`, `scheduledAt`, and a stable campaign-scoped `idempotencyKey`.
+
+The start time, minimum delay (seconds), and hourly limit controls spread the campaign's individual `scheduledAt` values. These controls do not change backend configuration: the Redis sender-wide delay and hourly quota remain authoritative, and may delay sends further. The selected hourly limit scopes the current campaign's planned schedule only.
+
+Run the API and worker as described above, then start the frontend from `frontend/`:
+
+```sh
+npm ci
+if [ ! -f .env ]; then cp .env.example .env; fi
+npm run dev
+```
+
+`VITE_API_BASE_URL` is the frontend API setting. It defaults to same-origin paths; Vite's development proxy forwards `/api` and `/health` to `http://127.0.0.1:3000`. For production, serve the API through the same-origin reverse proxy or provide an API origin that already permits browser access; this backend does not configure CORS. Do not put secrets in `VITE_` variables because Vite embeds them in client bundles.
 
 ## Prerequisites and setup
 
@@ -241,9 +257,11 @@ The backend suite includes Redis-backed state expiry/single-use tests and mocked
 
 Using Node.js 22.23.3/npm 10.9.9 from a temporary toolchain under `/tmp`, Prisma client generation, schema validation, migration status, backend typecheck, production build, Compose configuration validation, `git diff --check`, and the complete backend suite passed. The database reports all five migrations applied. The suite reports 39 passed, 0 failed, and 1 skipped: 19 scheduler tests use MySQL/Redis, the search tests use MySQL and a mocked Elasticsearch client (with Redis for Bull Board), and the Slack tests use MySQL/Redis with Slack HTTP mocked. The live Elasticsearch round-trip was not verified. The container is currently unhealthy because Elasticsearch's 90% disk watermark is exceeded and its primary shard is unassigned; search functionality needs to be rechecked after disk headroom is restored. No live Slack OAuth/message delivery or SMTP delivery was tested.
 
+For the frontend milestone, `npm run build` in `frontend/` passed under Node 22.23.3/npm 10.9.9. There is no frontend test script or test framework in the starter package. A manual headless Chrome smoke test confirmed the dashboard renders without a blank screen or application exceptions, both list empty states render, and a mocked API error shows its message and retry button. The test used a temporary localhost response stub; it did not submit through the live backend. Request fields and response parsing were checked against the backend routes. The provided Figma URL was inaccessible from the available inspection tools, so the interface has not been visually compared with that reference.
+
 ## Current limitations
 
-- No application user authentication, sender administration API, per-sender SMTP credentials, or frontend integration. Search and Bull Board are deployment-wide backend features, not tenant-isolated UI features.
+- No application user authentication/Google OAuth, sender administration API, or per-sender SMTP credentials. Search and Bull Board remain deployment-wide backend features, not tenant-isolated UI features.
 - Sender identities are stored in MySQL; `default` is seeded from environment configuration. Additional sender rows can be added through a future administrative path.
 - SMTP delivery is at-least-once under ambiguous crashes. MySQL state and SMTP acceptance cannot be committed atomically.
 - Redis rate reservations are atomic across workers but are not committed atomically with MySQL or SMTP. Redis data loss can reset recent quota history; a reservation made before a crash may conservatively use quota without an SMTP attempt.

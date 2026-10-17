@@ -2,6 +2,19 @@
 
 Audit date: 2026-10-17 (Asia/Kolkata)
 
+## Frontend dashboard milestone (2026-10-17)
+
+This work is based on committed `d7593b6` (`feat: add email search and queue dashboard`). Frontend changes are local and uncommitted; backend source and database were not changed in this milestone.
+
+- Replaced the starter card with a responsive React/Tailwind dashboard with Scheduled and Sent tabs, cursor pagination, loading/error/empty states, status and sender details, refresh, and a compose dialog.
+- Compose accepts comma/newline recipient text or CSV upload, deduplicates addresses, flags invalid entries, and posts one email per recipient using the existing `POST /api/emails/schedule` contract and campaign-scoped idempotency keys. Partial failures can be retried with the same keys.
+- Start time, minimum delay in seconds, and hourly limit controls spread the current campaign's `scheduledAt` values. They do not modify backend quota configuration; Redis server-side pacing and hourly limits remain authoritative.
+- `VITE_API_BASE_URL` configures the API base. It defaults to same-origin paths, and Vite proxies `/api` and `/health` to the local backend in development. Production needs a same-origin reverse proxy because the backend does not enable CORS.
+- `npm run build` in `frontend/` PASS under Node 22.23.3/npm 10.9.9. The package has no automated test script/framework. A manual headless Chrome smoke test confirmed the dashboard renders without a blank screen or application exceptions, the Scheduled and Sent empty states render, and a mocked API error displays its message and retry button. The smoke test used a temporary localhost response stub; no live browser-to-backend scheduling request was made.
+- The provided Figma URL was inaccessible through the available web inspection tool. The UI follows the requested dashboard pattern but has not been visually compared with the Figma reference.
+
+No Google OAuth, user profile, or backend changes are included in this milestone. `.env` was not changed; `frontend/.env.example` contains only the blank `VITE_API_BASE_URL` setting.
+
 ## Elasticsearch search and Bull Board milestone (2026-10-17)
 
 Baseline `858f121` was verified committed and pushed (`main` and `origin/main` matched) before this work. No `.env` was written. The additive migration `20261017160000_email_search_index_outbox` adds `Email.searchVersion`, creates a durable `EmailSearchOutbox`, and backfills one pending event for each existing email. It was applied to the existing MySQL database; all five migrations report up to date. No database reset or volume deletion occurred. Compose recreated the MySQL container to bind its already existing named volume on host port 13306; its data volume was retained.
@@ -112,11 +125,11 @@ Commands executed in this follow-up include `npm ci --no-audit --no-fund` in eac
 
 Hiring assignment: a full-stack email scheduling service with persistent delayed jobs, multiple senders, distributed rate limits, search, OAuth, Slack alerts, and a dashboard.
 
-Current stack: React + TypeScript + Vite + Tailwind CSS; Express + TypeScript; Prisma/MySQL; BullMQ/Redis; Nodemailer SMTP; Elasticsearch email indexing/search; and Bull Board queue monitoring. Google OAuth and frontend dashboard functionality are not implemented. Slack OAuth/notifications are committed in `858f121`; the Elasticsearch/Bull Board milestone is described above. The backend exposes schedule/list/detail/search APIs and `GET /health`.
+Current stack: React + TypeScript + Vite + Tailwind CSS dashboard; Express + TypeScript; Prisma/MySQL; BullMQ/Redis; Nodemailer SMTP; Elasticsearch email indexing/search; and Bull Board queue monitoring. Google OAuth and authenticated user profiles are not implemented. Slack OAuth/notifications are committed in `858f121`; the Elasticsearch/Bull Board milestone is described above. The backend exposes schedule/list/detail/search APIs and `GET /health`.
 
 ## Architecture and intended responsibilities
 
-The current implementation covers backend scheduling, transactional outboxes, SMTP worker, sender pacing, atomic sender hourly reservations, Slack OAuth/notifications, Elasticsearch search, and protected Bull Board. Remaining assignment responsibilities include the React dashboard and compose flow, Google OAuth/session endpoints, and deployment. Keep SMTP acceptance distinct from confirmed delivery: an SMTP server accepting a message does not prove inbox delivery. Exactly-once SMTP delivery is not claimed.
+The current implementation covers backend scheduling, transactional outboxes, SMTP worker, sender pacing, atomic sender hourly reservations, Slack OAuth/notifications, Elasticsearch search, protected Bull Board, and the React scheduling dashboard/compose flow. Remaining assignment responsibilities include Google OAuth/session/profile, live SMTP and Elasticsearch verification, and deployment/submission. Keep SMTP acceptance distinct from confirmed delivery: an SMTP server accepting a message does not prove inbox delivery. Exactly-once SMTP delivery is not claimed.
 
 ## Requirement status matrix
 
@@ -141,15 +154,15 @@ Legend: **Verified** means supported by current source/config inspection. Valida
 | Live Bull Board dashboard | Bull Board Express route with timing-safe Bearer token guard; email and Slack queues | Authorization and queue registration integration tests PASS against Redis | Configure `BULL_BOARD_TOKEN`; restrict access to trusted network | P1 |
 | Slack OAuth and persistent connection management | OAuth v2 routes/service; encrypted incoming webhook and singleton deployment connection | Implemented; mocked OAuth tests PASS; additive migrations applied | Configure real Slack app; later scope to authenticated tenant | P1 |
 | Slack quota notifications | Durable outbox, periodic recovery, authenticated FAILED inspection/replay, replay generations | Implemented; dedupe, retry, recovery, replay and revoke tests PASS | Live delivery unverified; operations are deployment-wide admin access | P1 |
-| React or Next.js with TypeScript | React + TypeScript + Vite source/config | Present; frontend production build previously PASS | Implement application screens | P0 |
-| Tailwind or modern CSS | Tailwind dependency and Vite plugin configured | Present; frontend production build previously PASS | Complete responsive design | P1 |
+| React or Next.js with TypeScript | React + TypeScript + Vite source/config | Implemented; production build PASS | Add Google OAuth/profile | P0 |
+| Tailwind or modern CSS | Tailwind dependency and Vite plugin configured | Implemented; production build PASS | Visual comparison against reference | P1 |
 | Real Google OAuth login/logout/profile | No auth implementation | NOT IMPLEMENTED | OAuth client credentials, callback, session/logout, profile | P0 |
-| Scheduled and sent email dashboard | Placeholder `App.tsx` only | NOT IMPLEMENTED | Add data-backed views and status states | P1 |
-| Compose fields and lead upload | Placeholder only | NOT IMPLEMENTED | Subject/body, CSV/text parsing, count, schedule, delay, limit | P1 |
-| Loading/empty/success/error UI | No application states | NOT IMPLEMENTED | Add accessible async states | P1 |
-| Figma-inspired UI | Starter centered card; reference not inspected | NOT IMPLEMENTED / visual comparison not performed | Inspect reference and implement dashboard styling | P2 |
+| Scheduled and sent email dashboard | API-backed tabs, status tables, cursor pagination | Implemented; production build PASS; no live browser/API flow verified | End-to-end browser verification | P1 |
+| Compose fields and lead upload | Subject/body, text/CSV recipients, count/validation, schedule/delay/hourly controls | Implemented; request shape inspected against backend | End-to-end scheduling verification; server config remains authoritative | P1 |
+| Loading/empty/error UI | Dashboard loading, empty, retry/error states; partial schedule failure notice | Implemented; production build PASS | Browser/accessibility review | P1 |
+| Figma-inspired UI | Responsive sidebar/table/compose layout based on assignment needs | Implemented but Figma comparison BLOCKED because reference was inaccessible to available tools | Compare with reference when accessible | P2 |
 | Private GitHub repo and reviewer invites | No repository visibility/invite evidence in local files | NOT VERIFIED | Confirm remotely; invite `mitrajit`, `Yadav036` | P2 |
-| README setup/architecture/limitations/features | README now documents backend architecture, config, migration, API, tests, reliability limits | Updated for this milestone | Keep current as features are verified | P2 |
+| README setup/architecture/limitations/features | README documents backend and frontend setup, API contract, pacing behavior, validation, and limitations | Updated for this milestone | Keep current as features are verified | P2 |
 | Demo video <=5 minutes | No artifact/evidence | NOT IMPLEMENTED | Record after stable end-to-end flow | P2 |
 | Hosted URL and submission form | No deployment configuration/evidence | NOT IMPLEMENTED | Deploy and submit when ready | P2 |
 | No fake OAuth/Slack, fabricated tests, or unsupported claims | Slack integration uses actual Slack endpoints; tests mock only external Slack HTTP calls | Mocked API behavior and DB/Redis validation PASS; live OAuth/delivery NOT VERIFIED | Configure a real Slack app for live verification | P0 |
@@ -177,7 +190,7 @@ No dependency installation was attempted. No environment values were read. `.env
 
 ## Git and environment (current update)
 
-- **Current milestone:** repository `/home/nmit/reachinbox-scheduler`; branch `main`, committed/pushed baseline `858f121` (`feat: add Slack integration and notification recovery`); Elasticsearch/Bull Board implementation and its validation state are described at the top of this handoff.
+- **Current milestone:** repository `/home/nmit/reachinbox-scheduler`; branch `main`, committed baseline `d7593b6` (`feat: add email search and queue dashboard`); frontend dashboard changes are local and uncommitted.
 - **Verified:** dependencies are installed from both lockfiles. Ignored `node_modules`, `dist`, and TypeScript build-info artifacts are present locally and excluded from Git.
 - **Verified:** root `.env` was not written or overwritten; `.env.example` contains placeholders only. No credential values were read or added.
 - **Verified:** Node 22.23.3/npm 10.9.9 were restored under `/tmp/reachinbox-node22`; system Node 18/npm 9 were unchanged. Compose/MySQL/Redis run with elevated Docker access. MySQL uses host port 13306 and existing named data volumes were retained.
@@ -198,9 +211,9 @@ No dependency installation was attempted. No environment values were read. `.env
 
 ## Remaining work after backend foundation
 
-1. Configure Ethereal SMTP credentials and verify one real test send and preview link.
-2. Continue remaining assignment requirements as separate milestones: Google OAuth and the frontend dashboard.
-3. Complete hosting, reviewer access, demo video, and submission after required features are implemented and verified.
+1. Implement real Google OAuth login/logout and user profile presentation.
+2. Configure Ethereal SMTP and restore Elasticsearch disk headroom for live service verification.
+3. Complete hosting, reviewer access, five-minute demo, and submission after remaining requirements are verified.
 
 **Dependencies:** the local Node 22/npm 10 toolchain and MySQL/Redis are now available; Docker commands require elevated socket access here, and MySQL is mapped to host port 13306 because 3306 is occupied. An Ethereal SMTP account/configuration and agreed application environment variables are still required. Do not invent credentials.
 
@@ -212,4 +225,4 @@ No dependency installation was attempted. No environment values were read. `.env
 - Configure Google OAuth and eventual hosting credentials securely when those milestones begin. For Slack, create an app and provide the five documented optional environment values before OAuth can be used.
 - Confirm GitHub repository privacy and reviewer invitations when ready to submit.
 
-This handoff records the verified backend scheduling, rate-limit, and Slack integration implementation. Live Slack credentials were unavailable; no frontend or unrelated integration milestone was started.
+This handoff records the backend scheduling, rate-limit, Slack, search/queue-monitoring, and frontend-dashboard milestones. Live Slack, SMTP, and Elasticsearch service verification remain incomplete; Google OAuth and deployment/submission work are outstanding.
