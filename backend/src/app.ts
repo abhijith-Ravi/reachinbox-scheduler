@@ -1,7 +1,12 @@
 import express, { type ErrorRequestHandler, type Request, type Response } from 'express'
+import { timingSafeEqual } from 'node:crypto'
+import type { Queue } from 'bullmq'
 import { PrismaClient } from '@prisma/client'
 import { z } from 'zod'
 import { findOrCreateEmail, IdempotencyConflictError, SenderNotFoundError } from './scheduling'
+import { SlackIntegration, SlackOAuthError } from './slack-integration'
+import { listFailedNotifications, NotificationNotFoundError, NotificationStateError, replayFailedNotification } from './slack-notifications'
+import type { SlackNotificationJobData } from './slack-queue'
 
 const scheduleSchema = z.object({
   senderId: z.string().min(1).max(64).default('default'),
@@ -18,7 +23,13 @@ const paginationSchema = z.object({
 })
 
 type EnqueueEmail = (emailId: string) => Promise<void>
-interface AppDependencies { prisma: PrismaClient; enqueueEmail: EnqueueEmail }
+interface AppDependencies {
+  prisma: PrismaClient
+  enqueueEmail: EnqueueEmail
+  slack?: SlackIntegration
+  slackManagementToken?: string
+  slackNotificationQueue?: Queue<SlackNotificationJobData>
+}
 
 export function createApp(dependencies: AppDependencies) {
   const app = express()
@@ -26,6 +37,64 @@ export function createApp(dependencies: AppDependencies) {
   app.use(express.json({ limit: '1mb' }))
 
   app.get('/health', (_request, response) => response.status(200).json({ status: 'ok' }))
+
+  app.get('/api/slack/oauth/start', async (request, response) => {
+    if (!dependencies.slack) return apiError(response, 503, 'SLACK_NOT_CONFIGURED', 'Slack integration is not configured.')
+    if (!authorizedSlackManagement(request.get('authorization'), dependencies.slackManagementToken)) return apiError(response, 401, 'SLACK_MANAGEMENT_UNAUTHORIZED', 'Slack management authorization is required.')
+    try {
+      return response.redirect(302, await dependencies.slack.startOAuth())
+    } catch (error) {
+      return slackError(response, error)
+    }
+  })
+
+  app.get('/api/slack/oauth/callback', async (request, response) => {
+    if (!dependencies.slack) return apiError(response, 503, 'SLACK_NOT_CONFIGURED', 'Slack integration is not configured.')
+    const params = new URLSearchParams()
+    for (const name of ['state', 'code', 'error']) {
+      const value = request.query[name]
+      if (typeof value === 'string') params.set(name, value)
+    }
+    try {
+      const connection = await dependencies.slack.handleCallback(params)
+      return response.status(200).json({ data: { connected: true, ...connection } })
+    } catch (error) {
+      return slackError(response, error)
+    }
+  })
+
+  app.get('/api/slack/connection', async (_request, response) => {
+    if (!dependencies.slack) return apiError(response, 503, 'SLACK_NOT_CONFIGURED', 'Slack integration is not configured.')
+    return response.json({ data: await dependencies.slack.getConnection() })
+  })
+
+  app.delete('/api/slack/connection', async (_request, response) => {
+    if (!dependencies.slack) return apiError(response, 503, 'SLACK_NOT_CONFIGURED', 'Slack integration is not configured.')
+    if (!authorizedSlackManagement(_request.get('authorization'), dependencies.slackManagementToken)) return apiError(response, 401, 'SLACK_MANAGEMENT_UNAUTHORIZED', 'Slack management authorization is required.')
+    await dependencies.slack.disconnect()
+    return response.status(200).json({ data: { disconnected: true } })
+  })
+
+  app.get('/api/slack/notifications/failed', async (request, response) => {
+    if (!authorizedSlackManagement(request.get('authorization'), dependencies.slackManagementToken)) return apiError(response, 401, 'SLACK_MANAGEMENT_UNAUTHORIZED', 'Slack management authorization is required.')
+    const parsed = z.object({ limit: z.coerce.number().int().min(1).max(100).default(50) }).safeParse(request.query)
+    if (!parsed.success) return apiError(response, 400, 'VALIDATION_ERROR', 'limit must be an integer from 1 to 100.')
+    const data = await listFailedNotifications(dependencies.prisma, parsed.data.limit)
+    return response.json({ data })
+  })
+
+  app.post('/api/slack/notifications/:id/replay', async (request, response) => {
+    if (!authorizedSlackManagement(request.get('authorization'), dependencies.slackManagementToken)) return apiError(response, 401, 'SLACK_MANAGEMENT_UNAUTHORIZED', 'Slack management authorization is required.')
+    if (!dependencies.slackNotificationQueue) return apiError(response, 503, 'SLACK_QUEUE_UNAVAILABLE', 'Slack notification queue is unavailable.')
+    try {
+      const data = await replayFailedNotification(dependencies.prisma, dependencies.slackNotificationQueue, request.params.id)
+      return response.status(202).json({ data })
+    } catch (error) {
+      if (error instanceof NotificationNotFoundError) return apiError(response, 404, 'NOTIFICATION_NOT_FOUND', error.message)
+      if (error instanceof NotificationStateError) return apiError(response, 409, 'NOTIFICATION_NOT_FAILED', error.message)
+      return apiError(response, 503, 'NOTIFICATION_REPLAY_UNAVAILABLE', 'Notification replay was queued for recovery or could not be completed.')
+    }
+  })
 
   app.post('/api/emails/schedule', async (request, response) => {
     const parsed = scheduleSchema.safeParse(request.body)
@@ -94,6 +163,13 @@ export function createApp(dependencies: AppDependencies) {
   return app
 }
 
+function authorizedSlackManagement(header: string | undefined, expected: string | undefined): boolean {
+  if (!header || !expected?.length || !header.startsWith('Bearer ')) return false
+  const supplied = Buffer.from(header.slice(7))
+  const configured = Buffer.from(expected)
+  return supplied.length === configured.length && timingSafeEqual(supplied, configured)
+}
+
 function parsePagination(request: Request, response: Response) {
   const parsed = paginationSchema.safeParse(request.query)
   if (!parsed.success) {
@@ -138,4 +214,9 @@ function publicEmail(email: {
 
 function apiError(response: Response, status: number, code: string, message: string) {
   return response.status(status).json({ error: { code, message } })
+}
+
+function slackError(response: Response, error: unknown) {
+  if (error instanceof SlackOAuthError) return apiError(response, error.status, error.code, error.message)
+  return apiError(response, 500, 'SLACK_INTEGRATION_ERROR', 'Slack integration request failed.')
 }

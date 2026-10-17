@@ -19,6 +19,18 @@ enum OutboxStatus {
   ENQUEUED
 }
 
+enum SlackConnectionStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum SlackNotificationStatus {
+  PENDING
+  DELIVERED
+  FAILED
+  SKIPPED
+}
+
 model Sender {
   id        String   @id @db.VarChar(64)
   email     String   @db.VarChar(320)
@@ -65,4 +77,38 @@ model EmailOutbox {
   email        Email        @relation(fields: [emailId], references: [id], onDelete: Cascade)
 
   @@index([status, createdAt])
+}
+
+model SlackConnection {
+  deploymentKey      String               @id @default("default") @db.VarChar(64)
+  workspaceId        String               @unique @db.VarChar(64)
+  workspaceName      String               @db.VarChar(191)
+  channelId          String               @db.VarChar(64)
+  channelName        String               @db.VarChar(191)
+  webhookCiphertext  String               @db.LongText
+  webhookNonce       String               @db.VarChar(32)
+  webhookAuthTag     String               @db.VarChar(32)
+  status             SlackConnectionStatus @default(ACTIVE)
+  installedAt        DateTime             @default(now()) @db.DateTime(3)
+  updatedAt          DateTime             @updatedAt @db.DateTime(3)
+}
+
+model SlackNotificationOutbox {
+  id              String                  @id @default(cuid()) @db.VarChar(191)
+  eventKey        String                  @unique @db.Char(64)
+  senderId        String                  @db.VarChar(64)
+  senderEmail     String                  @db.VarChar(320)
+  senderName      String?                 @db.VarChar(191)
+  hourlyLimit     Int                     @db.UnsignedInt
+  nextEligibleAt  DateTime?               @db.DateTime(3)
+  status          SlackNotificationStatus @default(PENDING)
+  attemptCount    Int                     @default(0)
+  replayCount     Int                     @default(0)
+  lastError       String?                 @db.Text
+  deliveredAt     DateTime?               @db.DateTime(3)
+  createdAt       DateTime                @default(now()) @db.DateTime(3)
+  updatedAt       DateTime                @updatedAt @db.DateTime(3)
+
+  @@index([status, createdAt])
+  @@index([senderId, createdAt])
 }

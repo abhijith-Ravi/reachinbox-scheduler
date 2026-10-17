@@ -202,6 +202,8 @@ test('per-sender zero hourly limit denies reservation when the Redis quota set i
   const result = await limiter.reserve(senderId, `email-${randomUUID()}`, 0)
   assert.equal(result.allowed, false)
   assert.equal(result.delayMs, ZERO_LIMIT_RECHECK_MS)
+  assert.equal(result.nextEligibleAt, null)
+  assert.ok(result.notificationPeriod?.startsWith('disabled:'))
   assert.equal(await rateRedis.zcard(key), 0)
 })
 
@@ -234,8 +236,13 @@ test('zero-limit email is not sent and is parked in BullMQ without a tight retry
   await emailQueue.add('deliver-email', { emailId: email.id }, emailJobOptions(email.id, 0))
 
   let sends = 0
+  let notifications = 0
   const worker = new Worker<EmailJobData>(EMAIL_QUEUE_NAME,
-    createEmailProcessor(prisma, { send: async () => { sends += 1; return { messageId: 'unexpected' } } }, limiter),
+    createEmailProcessor(prisma, { send: async () => { sends += 1; return { messageId: 'unexpected' } } }, limiter, async (event) => {
+      notifications += 1
+      assert.equal(event.hourlyLimit, 0)
+      assert.equal(event.nextEligibleAt, null)
+    }),
     { connection: redisConnection, concurrency: 1 })
   try {
     await worker.waitUntilReady()
@@ -246,6 +253,7 @@ test('zero-limit email is not sent and is parked in BullMQ without a tight retry
     await new Promise((resolve) => setTimeout(resolve, 100))
     assert.equal(await job.getState(), 'delayed')
     assert.equal(sends, 0)
+    assert.equal(notifications, 1)
     const stored = await prisma.email.findUniqueOrThrow({ where: { id: email.id } })
     assert.equal(stored.status, 'SCHEDULED')
     assert.equal(stored.attemptCount, 0)

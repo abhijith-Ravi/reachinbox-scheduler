@@ -10,7 +10,7 @@ Backend foundation for the ReachInbox email scheduling assignment. The frontend 
 - **Worker** claims an email through a conditional database transition, obtains an atomic Redis send reservation, delivers through configured SMTP, and records `SENT` only after SMTP accepts the message. SMTP credentials are environment-only.
 - **Rate coordination** uses one Redis Lua script and Redis server time to atomically check a sender's minimum interval and rolling-hour allowance across worker processes. A nullable `Sender.hourlyLimit` overrides the configured default.
 
-The SQL transaction cannot include Redis. If the API commits an email but cannot enqueue it, it leaves a pending outbox row and responds `503` with the saved email ID. Repeating the same request/key retries the enqueue; API or worker startup also scans scheduled and stale-processing rows and reconciles jobs. A crash after Redis enqueue but before the outbox update is safe to retry because the BullMQ job ID is stable. Redis should keep its configured AOF persistence enabled. Reconciliation runs at process startup and on the same-key retry; this milestone has no periodic scheduler.
+The SQL transaction cannot include Redis. If the API commits an email but cannot enqueue it, it leaves a pending outbox row and responds `503` with the saved email ID. Repeating the same request/key retries the enqueue; API or worker startup also scans scheduled and stale-processing rows and reconciles jobs. A crash after Redis enqueue but before the outbox update is safe to retry because the BullMQ job ID is stable. Redis should keep its configured AOF persistence enabled. Email schedule reconciliation runs at process startup and on the same-key retry; recurring Slack-notification recovery is described below.
 
 SMTP acceptance means the SMTP server accepted the message, not that the recipient's inbox received it. A crash after SMTP acceptance and before MySQL records `SENT` leaves an ambiguous outcome; retry can send a duplicate. Exactly-once SMTP delivery is not claimed. `SENT` and `smtpAcceptedAt` mean SMTP accepted the message.
 
@@ -140,9 +140,53 @@ npm test
 
 The automated suite uses the configured development MySQL/Redis services and a mocked SMTP transport; it creates uniquely keyed test records and cleans up those records/jobs. It does not send email. To check actual Ethereal delivery, configure credentials and a future schedule, start the API and worker, then inspect the returned email record and Ethereal preview link.
 
+## Slack OAuth and quota alerts
+
+Slack integration is optional; the API runs when Slack is not configured. Create a Slack app, enable OAuth v2, set the redirect URL to `https://<public-api-host>/api/slack/oauth/callback`, and request only the `incoming-webhook` scope. Slack returns a channel-specific incoming webhook. The app stores its URL using AES-256-GCM encryption and does not retain the OAuth bot access token. OAuth calls are made to Slack's real OAuth API; automated tests mock those HTTP calls.
+
+Set these values in the untracked root `.env`:
+
+```dotenv
+SLACK_CLIENT_ID=<Slack app client ID>
+SLACK_CLIENT_SECRET=<Slack app client secret>
+SLACK_REDIRECT_URL=https://<public-api-host>/api/slack/oauth/callback
+SLACK_TOKEN_ENCRYPTION_KEY=<64 hex characters from openssl rand -hex 32>
+SLACK_MANAGEMENT_TOKEN=<at least 32 random characters>
+```
+
+`GET /api/slack/oauth/start` requires `Authorization: Bearer $SLACK_MANAGEMENT_TOKEN` and redirects to Slack. Retrieve its `Location` header with `curl -sSI -H "Authorization: Bearer $SLACK_MANAGEMENT_TOKEN" http://127.0.0.1:3000/api/slack/oauth/start`, then open that Slack URL in a browser. Slack calls `GET /api/slack/oauth/callback`; the endpoint consumes short-lived, single-use Redis OAuth state and persists the installation. `GET /api/slack/connection` returns workspace/channel metadata and never a token. `DELETE /api/slack/connection` requires the same bearer token. Keep these management endpoints behind trusted network access as well. Since the product has no authenticated users or tenant model, this milestone associates exactly one Slack workspace/channel with the whole deployment (`deploymentKey=default`); it does not accept a client-supplied user ID as proof of identity. A later authenticated tenant model should replace that deployment-wide association.
+
+The migration `20261017130000_slack_connections_and_notifications` adds connection metadata and a Slack notification outbox. Apply it with `cd backend && npm run db:migrate`; it is additive and does not reset existing data. The webhook URL is encrypted at rest; workspace/channel metadata is not secret. Back up the encryption key securely because losing it makes the stored connection unusable.
+
+When Redis atomically denies a send for the rolling hourly quota, the email remains scheduled and delayed as before. The worker writes a durable notification outbox event and queues Slack delivery separately, so a slow Slack API does not block sending. A unique sender/period event key deduplicates the burst: one message per sender for the computed quota window; a zero-limit sender is limited to one event per UTC day. The worker reconciles pending outbox rows at startup and every 30 seconds while running. Reconciliation skips events already delivered/failed, respects the per-replay limit of eight attempts, and uses stable BullMQ job IDs so concurrent workers converge on one job. If a pending event's queue job has terminally failed or disappeared after exhausting attempts, the event becomes `FAILED` for explicit operator review rather than being retried indefinitely. A failed event is never automatically replayed.
+
+Delivery retries use BullMQ exponential backoff (up to eight attempts); HTTP 429 honors `Retry-After`. Invalid/revoked webhook responses mark the connection revoked and the event failed. A Slack API rejection or unavailable connection cannot change email state or quota decisions. A crash after Slack accepts a post but before MySQL records `DELIVERED` can result in a duplicate message; exactly-once Slack delivery is not claimed. Zero-limit email jobs remain parked for 24 hours between checks and do not call SMTP; their alert says sending depends on a configuration change, not that the 24-hour recheck is a predicted send time.
+
+### Inspecting and replaying failed Slack notifications
+
+Both operations require `Authorization: Bearer $SLACK_MANAGEMENT_TOKEN`. The failed-event endpoint returns at most 100 records (default 50) with ID, event type, sender ID, state, attempt/replay counts, timestamps, and sanitized error text. It never returns webhook or encryption data.
+
+```sh
+curl -H "Authorization: Bearer $SLACK_MANAGEMENT_TOKEN" \
+  'http://127.0.0.1:3000/api/slack/notifications/failed?limit=50'
+```
+
+After checking the failure, restore/reconnect Slack if needed and replay one event explicitly:
+
+```sh
+curl -X POST -H "Authorization: Bearer $SLACK_MANAGEMENT_TOKEN" \
+  "http://127.0.0.1:3000/api/slack/notifications/<notification-id>/replay"
+```
+
+Replay accepts only `FAILED` events and returns `202`; unknown IDs return `404`, other states return `409`, and invalid/missing management credentials return `401`. It resets that delivery attempt count, increments a persistent replay generation, and schedules a new deterministic BullMQ job. The unique outbox event key is unchanged, so ordinary quota-period deduplication remains intact. Each explicit replay grants one fresh bounded set of up to eight attempts; replay events one at a time after inspecting the cause to avoid flooding Slack. If enqueueing fails, the event remains `PENDING` and periodic worker recovery retries enqueueing within about 30 seconds. The worker must be running with the encryption key configured. Events that fail again can be inspected and explicitly replayed again. `DELIVERED` events cannot be replayed through this endpoint. Check Slack for delivery; no API endpoint exposes message content or delivery history beyond the failed list.
+
+### Slack tests
+
+The backend suite includes Redis-backed state expiry/single-use tests and mocked Slack HTTP exchange/delivery tests. They validate application behavior but do not prove live Slack credentials, workspace installation, or real message delivery.
+
 ## Current limitations
 
-- No authentication, sender administration API, per-sender SMTP credentials, Elasticsearch, Slack, Bull Board, or frontend integration in this milestone.
+- No application user authentication, sender administration API, per-sender SMTP credentials, Elasticsearch, Bull Board, or frontend integration.
 - Sender identities are stored in MySQL; `default` is seeded from environment configuration. Additional sender rows can be added through a future administrative path.
 - SMTP delivery is at-least-once under ambiguous crashes. MySQL state and SMTP acceptance cannot be committed atomically.
 - Redis rate reservations are atomic across workers but are not committed atomically with MySQL or SMTP. Redis data loss can reset recent quota history; a reservation made before a crash may conservatively use quota without an SMTP attempt.

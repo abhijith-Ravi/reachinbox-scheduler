@@ -4,6 +4,7 @@ import { z } from 'zod'
 dotenv.config({ path: process.env.DOTENV_CONFIG_PATH ?? '../.env' })
 
 const positiveInteger = (fallback: number) => z.coerce.number().int().positive().default(fallback)
+const optionalNonEmpty = z.preprocess((value) => value === '' ? undefined : value, z.string().min(1).optional())
 
 const envSchema = z.object({
   DATABASE_URL: z.url().refine((value) => new URL(value).protocol === 'mysql:', 'DATABASE_URL must use the mysql: scheme'),
@@ -24,6 +25,11 @@ const envSchema = z.object({
   EMAIL_PROCESSING_STALE_MS: positiveInteger(900000),
   EMAIL_MIN_SEND_DELAY_MS: z.coerce.number().int().nonnegative().default(1000),
   SENDER_MAX_EMAILS_PER_HOUR: positiveInteger(100),
+  SLACK_CLIENT_ID: optionalNonEmpty,
+  SLACK_CLIENT_SECRET: optionalNonEmpty,
+  SLACK_REDIRECT_URL: z.preprocess((value) => value === '' ? undefined : value, z.url().refine((value) => new URL(value).protocol === 'https:', 'SLACK_REDIRECT_URL must use HTTPS').optional()),
+  SLACK_TOKEN_ENCRYPTION_KEY: z.preprocess((value) => value === '' ? undefined : value, z.string().regex(/^[a-fA-F0-9]{64}$/, 'SLACK_TOKEN_ENCRYPTION_KEY must be 64 hexadecimal characters').optional()),
+  SLACK_MANAGEMENT_TOKEN: z.preprocess((value) => value === '' ? undefined : value, z.string().min(32).optional()),
 })
 
 const parsed = envSchema.safeParse(process.env)

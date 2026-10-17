@@ -2,6 +2,36 @@
 
 Audit date: 2026-10-17 (Asia/Kolkata)
 
+## Slack OAuth and quota-notification milestone (2026-10-17)
+
+Implementation added locally in this milestone. Additive migrations `20261017130000_slack_connections_and_notifications` and `20261017143000_slack_notification_replay_tracking` create the Slack tables and add a replay counter without changing or dropping scheduler data. Both were applied to the existing development database; no reset/recreation was performed. No live Slack credentials are configured, and no claim of live OAuth or delivery is made.
+
+- OAuth v2 uses Slack's real authorize and `oauth.v2.access` endpoints and requests only `incoming-webhook`. Redis state is random, expires after 10 minutes, and is consumed atomically once. Callback errors are sanitized. The channel webhook URL is AES-256-GCM encrypted; OAuth `access_token` is not stored. `SLACK_TOKEN_ENCRYPTION_KEY` is required to use Slack features, but optional for API startup.
+- With no authenticated user/tenant system, an installation belongs to one deployment-wide connection (`deploymentKey=default`), not a claimed arbitrary user. OAuth start and disconnect require `Authorization: Bearer <SLACK_MANAGEMENT_TOKEN>`; keep API routes network restricted. Connection status exposes workspace/channel metadata only. This is a deployment administrator gate, not application login; future tenant auth should replace it.
+- On an atomic hourly-quota denial, the email's database and BullMQ state remain as before. The processor inserts a durable notification outbox event and queues delivery asynchronously. Unique `(senderId, quota period)` hashing deduplicates burst events; disabled/zero-limit notices are deduplicated by UTC day. The separate BullMQ notification queue retries up to eight attempts with exponential backoff and honors Slack 429 `Retry-After`. Pending rows reconcile at startup and every 30 seconds while the worker runs. Stable generation-specific BullMQ IDs make concurrent recovery/replay idempotent. FAILED rows are not automatically re-enqueued. The authenticated failed-event list returns sanitized operational metadata; replay atomically claims only FAILED rows, resets the attempt count, increments the persisted `replayCount`, and creates one new bounded job generation. Missing connection results in no event; invalid webhook responses revoke the connection and fail the event. A crash after Slack accepts a post but before MySQL records it can duplicate the Slack message. No email is dropped or marked SENT due to Slack failure.
+- Zero hourly limit remains fail-closed; jobs are parked for a 24-hour recheck, do not change quota history, and do not invoke SMTP. Alerts correctly say eligibility depends on a limit configuration change rather than mislabeling the recheck time as a send-eligible time. Notification failure does not affect that behavior.
+
+Required environment: `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_REDIRECT_URL` (configure exactly `https://<public-api-host>/api/slack/oauth/callback` in the Slack app), `SLACK_TOKEN_ENCRYPTION_KEY` (32-byte hex key), and `SLACK_MANAGEMENT_TOKEN` (minimum 32 characters). `.env.example` contains placeholders only. Never commit a real secret. Run migration with `cd backend && npm run db:migrate`; do not reset the database.
+
+Slack endpoints: `GET /api/slack/oauth/start` (management bearer token; redirects to Slack), `GET /api/slack/oauth/callback` (Slack callback), `GET /api/slack/connection` (metadata only), and `DELETE /api/slack/connection` (management bearer token). See README for setup commands and limitations.
+
+Failed notification operations use the same management bearer token: `GET /api/slack/notifications/failed?limit=50` lists up to 100 sanitized records; `POST /api/slack/notifications/:id/replay` replays only a FAILED event. Restore/reconnect Slack, inspect an event, then replay one at a time. Pending enqueue failures recover automatically within about 30 seconds while the worker runs; retry-exhausted events require this explicit operator replay. Each replay is limited to eight attempts. Slack acceptance followed by a process crash before the MySQL `DELIVERED` update remains a duplicate-delivery window.
+
+**Validation run in this milestone** (backend directory; Node 22/npm 10 from `/tmp/reachinbox-toolchain`; command-scoped local `DATABASE_URL` and `DEFAULT_SENDER_EMAIL`; `.env` was not created/edited):
+
+| Command/check | Result |
+|---|---|
+| `npm run prisma:generate` | PASS, Prisma Client 6.19 generated. |
+| `npm run prisma:validate` | PASS, schema valid. |
+| `npm run db:migrate` | PASS, applied additive Slack connection/notification and replay-tracking migrations to existing MySQL. No reset/recreation. |
+| `npx prisma migrate status` | PASS, all 4 migrations applied; schema up to date. |
+| `npm run typecheck` | PASS. |
+| `npm run build` | PASS. |
+| `npm test` | PASS, 32 tests, 0 failed. Includes 19 existing MySQL/Redis integration tests plus 13 Slack tests; OAuth state and BullMQ recovery use Redis, Slack connection/outbox/API tests use MySQL with unique test records, Slack HTTP is mocked, and selected service tests use fakes. Existing SMTP is mocked. |
+| `git diff --check` | PASS (see final milestone diff review below). |
+
+Slack tests cover OAuth authorize scope and mocked exchange/persistence, denied/missing/expired/replayed state, exchange rejection, AES-GCM tamper detection, outbox deduplication, no-connection behavior, notification payload privacy, 429 delay, periodic recovery, failed-event authentication/inspection/replay, replay/recovery races, retry-limit enforcement, and unusable webhook revocation. They do not prove live Slack OAuth or real Slack message delivery. Slack HTTP calls are mocked; connection/outbox/API tests use MySQL and OAuth state/BullMQ tests use Redis.
+
 ## Backend scheduling and rate-limit milestone update (2026-10-17)
 
 This update supersedes the initial starter-state implementation matrix and validation section below.
@@ -10,7 +40,7 @@ This update supersedes the initial starter-state implementation matrix and valid
 |---|---|
 | Database | Prisma 6.19 models `Sender`, `Email`, and `EmailOutbox`; unique idempotency/job keys and status/schedule indexes. This milestone adds nullable `Sender.hourlyLimit` with additive migration `20261017120000_sender_rate_limits`. `prisma validate`, `migrate deploy`, and `migrate status` passed; database is up to date. No data or volumes were reset. |
 | API | `POST /api/emails/schedule`, `GET /api/emails/scheduled`, `GET /api/emails/sent`, `GET /api/emails/:id`, and preserved `GET /health`. Integration tests cover validation, lists/details, replay/conflict, and concurrent idempotency. Compiled API health probe returned HTTP 200 with `{"status":"ok"}`. |
-| Queue and recovery | BullMQ 6 + Redis, stable job ID per Email, SQL transactional outbox, startup reconciliation in API/worker, and same-key enqueue retry. Redis Lua reservation coordinates minimum send-start spacing and rolling 60-minute sender quotas atomically across workers. Denied jobs return to BullMQ delayed state; email rows remain `SCHEDULED`. No cron or periodic scheduler. |
+| Queue and recovery | BullMQ 6 + Redis, stable job ID per Email, SQL transactional outbox, startup email reconciliation in API/worker, and same-key enqueue retry. Redis Lua reservation coordinates minimum send-start spacing and rolling 60-minute sender quotas atomically across workers. Denied jobs return to BullMQ delayed state; email rows remain `SCHEDULED`. Slack notifications additionally use 30-second worker-managed periodic recovery; no cron is used. |
 | Worker and state | Separate worker entrypoint; configurable concurrency, capped attempts, exponential backoff, conditional transitions `SCHEDULED → PROCESSING → SENT/FAILED`, persisted SMTP attempts/errors. SMTP retries reuse an email's Redis quota reservation within the rolling window. Deferrals and Redis coordination errors do not increment SMTP attempt count. |
 | SMTP | Nodemailer Ethereal transport is implemented and requires credentials before worker startup. Missing-credential check produced the expected clear startup error. No credentials are configured, so real Ethereal delivery and preview URL were not verified. `SENT` means SMTP acceptance, not inbox delivery. |
 | Validation | PASS: Prisma client generation and schema validation; typecheck; production build; additive migration deploy/status; all 19 integration tests against development MySQL/Redis, including zero-limit parking, real Redis concurrency and BullMQ delayed-job worker restart. Tests use mocked SMTP, unique sender/email IDs, and targeted cleanup. SMTP delivery was not tested. |
@@ -54,11 +84,11 @@ Commands executed in this follow-up include `npm ci --no-audit --no-fund` in eac
 
 Hiring assignment: a full-stack email scheduling service with persistent delayed jobs, multiple senders, distributed rate limits, search, OAuth, Slack alerts, and a dashboard.
 
-Current stack: React + TypeScript + Vite + Tailwind CSS; Express + TypeScript; Prisma/MySQL; BullMQ/Redis; Nodemailer SMTP transport. Elasticsearch, Google OAuth, Slack, Bull Board, and dashboard functionality are not implemented. The frontend remains a placeholder. The backend exposes schedule/list/detail APIs and `GET /health`.
+Current stack: React + TypeScript + Vite + Tailwind CSS; Express + TypeScript; Prisma/MySQL; BullMQ/Redis; Nodemailer SMTP transport. Elasticsearch, Google OAuth, Bull Board, and dashboard functionality are not implemented. Slack OAuth and quota notification code is in the current uncommitted milestone described above. The frontend remains a placeholder. The backend exposes schedule/list/detail APIs and `GET /health`.
 
 ## Architecture and intended responsibilities
 
-The current implementation covers the backend scheduling foundation, transactional outbox, SMTP worker, sender pacing, and atomic sender hourly reservations. Remaining assignment responsibilities include the React dashboard and compose flow; OAuth/session endpoints; Elasticsearch search; Slack OAuth and quota notifications; and Bull Board. Keep SMTP acceptance distinct from confirmed delivery: an SMTP server accepting a message does not prove inbox delivery. Exactly-once SMTP delivery is not claimed.
+The current implementation covers backend scheduling, transactional outbox, SMTP worker, sender pacing, atomic sender hourly reservations, and this milestone's Slack OAuth/notification implementation. Remaining assignment responsibilities include the React dashboard and compose flow, Google OAuth/session endpoints, Elasticsearch search, and Bull Board. Keep SMTP acceptance distinct from confirmed delivery: an SMTP server accepting a message does not prove inbox delivery. Exactly-once SMTP delivery is not claimed.
 
 ## Requirement status matrix
 
@@ -81,8 +111,8 @@ Legend: **Verified** means supported by current source/config inspection. Valida
 | Restart recovery | Startup scans scheduled/stale records and reconciles Redis jobs; Redis AOF enabled | Implemented; missing-job recovery test PASS | Full kill/restart with live SMTP not run | P0 |
 | Elasticsearch indexing and email search | No dependency/config/code | NOT IMPLEMENTED | Index accepted/sent records and expose search | P1 |
 | Live Bull Board dashboard | No dependency/config/route | NOT IMPLEMENTED | Mount authenticated queue UI | P1 |
-| Real Slack OAuth and persistent connection management | No OAuth, Slack, or storage code | NOT IMPLEMENTED | OAuth flow, token storage, reconnect/disconnect | P1 |
-| Slack quota notifications | No Slack integration | NOT IMPLEMENTED | Send real alerts; handle absent/reconnecting connection safely | P1 |
+| Slack OAuth and persistent connection management | OAuth v2 routes/service; encrypted incoming webhook and singleton deployment connection | Implemented; mocked OAuth tests PASS; additive migrations applied | Configure real Slack app; later scope to authenticated tenant | P1 |
+| Slack quota notifications | Durable outbox, periodic recovery, authenticated FAILED inspection/replay, replay generations | Implemented; dedupe, retry, recovery, replay and revoke tests PASS | Live delivery unverified; operations are deployment-wide admin access | P1 |
 | React or Next.js with TypeScript | React + TypeScript + Vite source/config | Present; frontend production build previously PASS | Implement application screens | P0 |
 | Tailwind or modern CSS | Tailwind dependency and Vite plugin configured | Present; frontend production build previously PASS | Complete responsive design | P1 |
 | Real Google OAuth login/logout/profile | No auth implementation | NOT IMPLEMENTED | OAuth client credentials, callback, session/logout, profile | P0 |
@@ -94,7 +124,7 @@ Legend: **Verified** means supported by current source/config inspection. Valida
 | README setup/architecture/limitations/features | README now documents backend architecture, config, migration, API, tests, reliability limits | Updated for this milestone | Keep current as features are verified | P2 |
 | Demo video <=5 minutes | No artifact/evidence | NOT IMPLEMENTED | Record after stable end-to-end flow | P2 |
 | Hosted URL and submission form | No deployment configuration/evidence | NOT IMPLEMENTED | Deploy and submit when ready | P2 |
-| No fake OAuth/Slack, fabricated tests, or unsupported claims | Current code has no integrations or test claims | Verified in inspected code/docs | Keep claims tied to verified behavior | P0 |
+| No fake OAuth/Slack, fabricated tests, or unsupported claims | Slack integration uses actual Slack endpoints; tests mock only external Slack HTTP calls | Mocked API behavior and DB/Redis validation PASS; live OAuth/delivery NOT VERIFIED | Configure a real Slack app for live verification | P0 |
 
 ## Validation performed in initial audit (superseded)
 
@@ -124,7 +154,7 @@ No dependency installation was attempted. No environment values were read. `.env
 - **Verified:** root `.env` is absent and untouched; `.env.example` was extended with placeholder backend configuration. No credential values were read or written.
 - **Verified:** Node 22.23.3/npm 10.9.9 are available at `/tmp/reachinbox-toolchain` without changing system Node 18.19.1/npm 9.2.0. Docker Compose works with elevated socket access. MySQL and Redis are running with named volumes intact.
 - **Runtime constraint:** host port 3306 is occupied, so this Compose project uses host port 13306 for MySQL. Docker API access is denied without elevation in this managed environment.
-- **Still requires setup:** Google OAuth, Ethereal SMTP, Slack OAuth, Elasticsearch, and GitHub/deployment credentials have not been configured or verified. Never put real credentials in tracked files.
+- **Still requires setup:** Google OAuth, Ethereal SMTP, live Slack OAuth, Elasticsearch, and GitHub/deployment credentials have not been configured or verified. Never put real credentials in tracked files.
 
 ## Risks and engineering decisions
 
@@ -139,7 +169,7 @@ No dependency installation was attempted. No environment values were read. `.env
 ## Remaining work after backend foundation
 
 1. Configure Ethereal SMTP credentials and verify one real test send and preview link.
-2. Continue remaining assignment requirements as separate milestones: Slack, search/Bull Board, Google OAuth, and the frontend dashboard.
+2. Continue remaining assignment requirements as separate milestones: search/Bull Board, Google OAuth, and the frontend dashboard.
 3. Complete hosting, reviewer access, demo video, and submission after required features are implemented and verified.
 
 **Dependencies:** the local Node 22/npm 10 toolchain and MySQL/Redis are now available; Docker commands require elevated socket access here, and MySQL is mapped to host port 13306 because 3306 is occupied. An Ethereal SMTP account/configuration and agreed application environment variables are still required. Do not invent credentials.
@@ -149,7 +179,7 @@ No dependency installation was attempted. No environment values were read. `.env
 - Configure `SMTP_USER` and `SMTP_PASS` with actual Ethereal credentials to run the worker and verify real SMTP acceptance.
 - Set `EMAIL_MIN_SEND_DELAY_MS` (milliseconds) and `SENDER_MAX_EMAILS_PER_HOUR` (rolling 60-minute default) in the environment as needed. A sender-specific `hourlyLimit` can be set on its `Sender` row; there is not yet a sender administration API.
 - Use `PATH=/tmp/reachinbox-toolchain/node_modules/.bin:$PATH` for Node 22/npm 10 in this environment; request elevated Docker access for Compose commands. MySQL is mapped to host port 13306 because 3306 is occupied.
-- Configure Google OAuth, Slack, and eventual hosting credentials securely when those later milestones begin.
+- Configure Google OAuth and eventual hosting credentials securely when those milestones begin. For Slack, create an app and provide the five documented optional environment values before OAuth can be used.
 - Confirm GitHub repository privacy and reviewer invitations when ready to submit.
 
-This handoff records the verified backend scheduling and rate-limit milestones; no frontend or unrelated integration milestone was started.
+This handoff records the verified backend scheduling, rate-limit, and Slack integration implementation. Live Slack credentials were unavailable; no frontend or unrelated integration milestone was started.

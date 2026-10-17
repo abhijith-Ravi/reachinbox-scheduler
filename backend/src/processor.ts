@@ -4,8 +4,14 @@ import { config } from './config'
 import type { EmailTransport } from './email-transport'
 import type { EmailJobData } from './queue'
 import type { SenderRateLimiter } from './rate-limit'
+import type { QuotaNotificationInput } from './slack-notifications'
 
-export function createEmailProcessor(db: PrismaClient, transport: EmailTransport, limiter: SenderRateLimiter) {
+export function createEmailProcessor(
+  db: PrismaClient,
+  transport: EmailTransport,
+  limiter: SenderRateLimiter,
+  onQuotaLimited?: (notification: QuotaNotificationInput) => Promise<void>,
+) {
   return async (job: Job<EmailJobData>): Promise<void> => {
     const maxAttempts = job.opts.attempts ?? config.EMAIL_MAX_ATTEMPTS
     const staleBefore = new Date(Date.now() - config.EMAIL_PROCESSING_STALE_MS)
@@ -55,6 +61,22 @@ export function createEmailProcessor(db: PrismaClient, transport: EmailTransport
         where: { id: email.id, status: 'PROCESSING' },
         data: { status: 'SCHEDULED', processingStartedAt: null },
       })
+      if (onQuotaLimited && permit.notificationPeriod
+        && (permit.reason === 'hourly_limit' || permit.reason === 'disabled')) {
+        try {
+          await onQuotaLimited({
+            senderId: email.senderId,
+            senderEmail: email.sender.email,
+            senderName: email.sender.name,
+            hourlyLimit: permit.effectiveLimit,
+            nextEligibleAt: permit.nextEligibleAt,
+            notificationPeriod: permit.notificationPeriod,
+          })
+        } catch {
+          // Notification persistence/queue failures must not change email delivery state.
+          console.error('Could not queue sender quota notification.')
+        }
+      }
       if (!job.token) throw new Error('Cannot defer the email because BullMQ did not provide a lock token.')
       await job.moveToDelayed(Date.now() + Math.max(1, permit.delayMs), job.token)
       throw new DelayedError()

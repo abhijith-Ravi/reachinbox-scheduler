@@ -7,6 +7,8 @@ import { reconcileScheduledEmails } from './outbox'
 import { createEmailProcessor } from './processor'
 import { createEmailQueue, EMAIL_QUEUE_NAME, redisConnection, type EmailJobData } from './queue'
 import { SenderRateLimiter } from './rate-limit'
+import { createSlackNotificationQueue } from './slack-queue'
+import { createSlackNotificationWorker, enqueueQuotaNotification, reconcileSlackNotifications, startSlackNotificationReconciler } from './slack-notifications'
 
 async function main(): Promise<void> {
   assertSmtpConfigured()
@@ -20,7 +22,26 @@ async function main(): Promise<void> {
   if (recovered) console.info(`Reconciled ${recovered} persisted scheduled email(s).`)
 
   const limiter = new SenderRateLimiter(rateRedis, config.EMAIL_MIN_SEND_DELAY_MS, config.SENDER_MAX_EMAILS_PER_HOUR)
-  const worker = new Worker<EmailJobData>(EMAIL_QUEUE_NAME, createEmailProcessor(prisma, createEtherealTransport(), limiter), {
+  const slackQueue = createSlackNotificationQueue()
+  await slackQueue.waitUntilReady()
+  let slackWorker: ReturnType<typeof createSlackNotificationWorker> | undefined
+  let slackReconciler: ReturnType<typeof startSlackNotificationReconciler> | undefined
+  const onQuotaLimited = config.SLACK_TOKEN_ENCRYPTION_KEY
+    ? (notification: Parameters<typeof enqueueQuotaNotification>[2]) => enqueueQuotaNotification(prisma, slackQueue, notification)
+    : undefined
+  if (config.SLACK_TOKEN_ENCRYPTION_KEY) {
+    try {
+      const queued = await reconcileSlackNotifications(prisma, slackQueue)
+      if (queued) console.info(`Reconciled ${queued} pending Slack notification(s).`)
+    } catch {
+      console.error('Slack notification startup reconciliation failed; periodic recovery will retry.')
+    }
+    slackWorker = createSlackNotificationWorker(prisma, config.SLACK_TOKEN_ENCRYPTION_KEY)
+    await slackWorker.waitUntilReady()
+    slackReconciler = startSlackNotificationReconciler(prisma, slackQueue)
+  }
+
+  const worker = new Worker<EmailJobData>(EMAIL_QUEUE_NAME, createEmailProcessor(prisma, createEtherealTransport(), limiter, onQuotaLimited), {
     connection: redisConnection,
     concurrency: config.WORKER_CONCURRENCY,
   })
@@ -31,6 +52,9 @@ async function main(): Promise<void> {
 
   const shutdown = async () => {
     await worker.close()
+    await slackReconciler?.close()
+    await slackWorker?.close()
+    await slackQueue.close()
     await emailQueue.close()
     await rateRedis.quit()
     await prisma.$disconnect()
