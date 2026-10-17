@@ -2,6 +2,15 @@
 
 Audit date: 2026-10-17 (Asia/Kolkata)
 
+## Google sign-in milestone (2026-10-17)
+
+Implemented on top of `90cf289` as a Google Identity Services login/session milestone. Google Identity Services supplies an ID credential; the API verifies it with `google-auth-library`, requires a verified email, then issues an eight-hour HMAC-signed HttpOnly SameSite=Lax cookie (Secure in production). No Google client secret or credential is stored in the browser. Logout clears the cookie. Email list, detail, search, and schedule routes require a valid session when either Google backend setting is configured; they remain in prior local mode when Google is unconfigured. A half-configured backend fails closed.
+
+- `GET /api/auth/session`, `POST /api/auth/google`, and `POST /api/auth/logout` implement session inspection, credential verification, and logout. The frontend uses Google Identity Services, displays verified name/email/avatar, and handles loading, configuration errors, sign-in errors/cancellation, and logout.
+- Configure a Google Cloud **Web application** OAuth client with JavaScript origin `http://localhost:5173` (add `http://127.0.0.1:5173` only if used) and the production frontend origin. Set the same public `GOOGLE_CLIENT_ID` in backend `.env` and `VITE_GOOGLE_CLIENT_ID` in frontend `.env`. Generate private `GOOGLE_SESSION_SECRET` with `openssl rand -hex 32`. The popup flow needs no redirect URI or client secret.
+- No MySQL schema changes. Google identity is not persisted as tenant ownership, so authenticated users still share deployment-wide email records; this is not multi-tenant isolation. The user reports browser verification of Google sign-in, profile display, and logout with a configured Google Cloud client.
+- Validation: the zero-limit processor test passes alone (1 passed, 18 skipped), and the search outbox test passes alone (1 passed, 7 skipped). Full serial `npm test` passes **42 tests, 0 failed, 1 skipped**; serialization prevents tests from racing over their shared BullMQ/Redis queues, while the search test scopes reconciliation to its unique fixture email because the existing database has other pending outbox rows. The live Elasticsearch test is skipped because `ELASTICSEARCH_URL` is unset. Backend typecheck/build pass. Frontend production build passes with the temporary Node 22.23.3 toolchain; system Node 18.19.1 remains too old for Vite 8. The user reports live browser verification of Google sign-in, profile display, and logout.
+
 ## Frontend dashboard milestone (2026-10-17)
 
 This work is based on committed `d7593b6` (`feat: add email search and queue dashboard`). Frontend changes are local and uncommitted; backend source and database were not changed in this milestone.
@@ -83,8 +92,8 @@ This update supersedes the initial starter-state implementation matrix and valid
 | API | `POST /api/emails/schedule`, `GET /api/emails/scheduled`, `GET /api/emails/sent`, `GET /api/emails/:id`, and preserved `GET /health`. Integration tests cover validation, lists/details, replay/conflict, and concurrent idempotency. Compiled API health probe returned HTTP 200 with `{"status":"ok"}`. |
 | Queue and recovery | BullMQ 6 + Redis, stable job ID per Email, SQL transactional outbox, startup email reconciliation in API/worker, and same-key enqueue retry. Redis Lua reservation coordinates minimum send-start spacing and rolling 60-minute sender quotas atomically across workers. Denied jobs return to BullMQ delayed state; email rows remain `SCHEDULED`. Slack notifications additionally use 30-second worker-managed periodic recovery; no cron is used. |
 | Worker and state | Separate worker entrypoint; configurable concurrency, capped attempts, exponential backoff, conditional transitions `SCHEDULED → PROCESSING → SENT/FAILED`, persisted SMTP attempts/errors. SMTP retries reuse an email's Redis quota reservation within the rolling window. Deferrals and Redis coordination errors do not increment SMTP attempt count. |
-| SMTP | Nodemailer Ethereal transport is implemented and requires credentials before worker startup. Missing-credential check produced the expected clear startup error. No credentials are configured, so real Ethereal delivery and preview URL were not verified. `SENT` means SMTP acceptance, not inbox delivery. |
-| Validation | PASS: Prisma client generation and schema validation; typecheck; production build; additive migration deploy/status; all 19 integration tests against development MySQL/Redis, including zero-limit parking, real Redis concurrency and BullMQ delayed-job worker restart. Tests use mocked SMTP, unique sender/email IDs, and targeted cleanup. SMTP delivery was not tested. |
+| SMTP | Nodemailer Ethereal transport is implemented and requires credentials before worker startup. Missing-credential check produced the expected clear startup error. The user reports a scheduled test message was accepted by Ethereal SMTP; its preview showed the expected recipient, subject, and body. This does not verify delivery to a recipient inbox. `SENT` means SMTP acceptance, not inbox delivery. |
+| Validation | PASS: Prisma client generation and schema validation; typecheck; production build; additive migration deploy/status; all 19 integration tests against development MySQL/Redis, including zero-limit parking, real Redis concurrency and BullMQ delayed-job worker restart. Tests use mocked SMTP, unique sender/email IDs, and targeted cleanup. A separate user-reported Ethereal acceptance/preview check was performed; no recipient-inbox delivery is claimed. |
 | Git and files | Base commit was `ae5a478` (`feat: implement email scheduling backend`); these backend milestone changes were subsequently committed before Slack and search work. Frontend code was not modified in that milestone. `.env` remains untouched. |
 
 Known boundaries: MySQL, Redis, and SMTP cannot share one atomic transaction. Startup reconciliation and same-key retries repair pending outbox work. Redis Lua makes each sender reservation atomic and uses Redis server time, but data loss can erase recent rate history. A reservation is conservative: a crash before SMTP consumes quota until its 60-minute entry expires. A crash after SMTP acceptance but before MySQL records success remains ambiguous and can lead to duplicate delivery. Exactly-once SMTP delivery is not claimed.
@@ -125,11 +134,11 @@ Commands executed in this follow-up include `npm ci --no-audit --no-fund` in eac
 
 Hiring assignment: a full-stack email scheduling service with persistent delayed jobs, multiple senders, distributed rate limits, search, OAuth, Slack alerts, and a dashboard.
 
-Current stack: React + TypeScript + Vite + Tailwind CSS dashboard; Express + TypeScript; Prisma/MySQL; BullMQ/Redis; Nodemailer SMTP; Elasticsearch email indexing/search; and Bull Board queue monitoring. Google OAuth and authenticated user profiles are not implemented. Slack OAuth/notifications are committed in `858f121`; the Elasticsearch/Bull Board milestone is described above. The backend exposes schedule/list/detail/search APIs and `GET /health`.
+Current stack: React + TypeScript + Vite + Tailwind CSS dashboard; Express + TypeScript; Prisma/MySQL; BullMQ/Redis; Nodemailer SMTP; Elasticsearch email indexing/search; Bull Board queue monitoring; and Google Identity Services sign-in with verified profile/session cookies. Google sign-in, profile display, and logout were verified in the browser, as reported by the user. Slack OAuth/notifications are committed in `858f121`; the Elasticsearch/Bull Board milestone is described above. The backend exposes schedule/list/detail/search and auth session APIs plus `GET /health`.
 
 ## Architecture and intended responsibilities
 
-The current implementation covers backend scheduling, transactional outboxes, SMTP worker, sender pacing, atomic sender hourly reservations, Slack OAuth/notifications, Elasticsearch search, protected Bull Board, and the React scheduling dashboard/compose flow. Remaining assignment responsibilities include Google OAuth/session/profile, live SMTP and Elasticsearch verification, and deployment/submission. Keep SMTP acceptance distinct from confirmed delivery: an SMTP server accepting a message does not prove inbox delivery. Exactly-once SMTP delivery is not claimed.
+The current implementation covers backend scheduling, transactional outboxes, SMTP worker, sender pacing, atomic sender hourly reservations, Slack OAuth/notifications, Elasticsearch search, protected Bull Board, Google sign-in/profile, and the React scheduling dashboard/compose flow. Remaining assignment responsibilities include live Elasticsearch verification and deployment/submission. Google authentication does not add tenant ownership; user data is still deployment-wide. Keep SMTP acceptance distinct from confirmed delivery: an SMTP server accepting a message does not prove inbox delivery. Exactly-once SMTP delivery is not claimed.
 
 ## Requirement status matrix
 
@@ -140,7 +149,7 @@ Legend: **Verified** means supported by current source/config inspection. Valida
 | Node.js, TypeScript, Express backend | `backend/package.json`, `backend/src/` | Implemented; typecheck/build PASS on Node 22 | Continue API features as later milestones require | P0 |
 | MySQL relational schema | Prisma models and migration under `backend/prisma` | Implemented; migration applied and schema diff empty | Extend for future sender/admin needs | P0 |
 | BullMQ backed by Redis | BullMQ queue and configured Redis connection | Implemented; delayed-job integration tests PASS | Operational monitoring later | P0 |
-| Ethereal SMTP delivery | Nodemailer transport and safe config handling | Code implemented; actual delivery NOT VERIFIED (credentials absent) | Configure Ethereal and run a real test send | P1 |
+| Ethereal SMTP delivery | Nodemailer transport and safe config handling | Ethereal accepted a scheduled test message and its preview showed the intended recipient, subject, and body (user-reported); inbox receipt is unverified | Verify recipient inbox only if needed | P1 |
 | Persistent delayed scheduling; no cron | BullMQ delayed jobs plus DB transactional outbox | Implemented; recovery tests PASS; no cron used | No current work in this slice | P0 |
 | Multiple senders | `Sender` relation and senderId in API; `default` seeded from config | Data model implemented; sender administration API NOT IMPLEMENTED | Add sender management later | P1 |
 | Configurable worker concurrency | `WORKER_CONCURRENCY` and BullMQ Worker | Implemented by code/config; compile PASS | Validate under real SMTP load later | P1 |
@@ -154,9 +163,9 @@ Legend: **Verified** means supported by current source/config inspection. Valida
 | Live Bull Board dashboard | Bull Board Express route with timing-safe Bearer token guard; email and Slack queues | Authorization and queue registration integration tests PASS against Redis | Configure `BULL_BOARD_TOKEN`; restrict access to trusted network | P1 |
 | Slack OAuth and persistent connection management | OAuth v2 routes/service; encrypted incoming webhook and singleton deployment connection | Implemented; mocked OAuth tests PASS; additive migrations applied | Configure real Slack app; later scope to authenticated tenant | P1 |
 | Slack quota notifications | Durable outbox, periodic recovery, authenticated FAILED inspection/replay, replay generations | Implemented; dedupe, retry, recovery, replay and revoke tests PASS | Live delivery unverified; operations are deployment-wide admin access | P1 |
-| React or Next.js with TypeScript | React + TypeScript + Vite source/config | Implemented; production build PASS | Add Google OAuth/profile | P0 |
+| React or Next.js with TypeScript | React + TypeScript + Vite source/config | Implemented; production build PASS | No current implementation work | P0 |
 | Tailwind or modern CSS | Tailwind dependency and Vite plugin configured | Implemented; production build PASS | Visual comparison against reference | P1 |
-| Real Google OAuth login/logout/profile | No auth implementation | NOT IMPLEMENTED | OAuth client credentials, callback, session/logout, profile | P0 |
+| Real Google OAuth login/logout/profile | GIS popup + server ID-token verification + signed session cookie | Implemented; mocked-token/session tests and browser sign-in/profile/logout verified (user-reported) | Add tenant ownership before multi-user use | P0 |
 | Scheduled and sent email dashboard | API-backed tabs, status tables, cursor pagination | Implemented; production build PASS; no live browser/API flow verified | End-to-end browser verification | P1 |
 | Compose fields and lead upload | Subject/body, text/CSV recipients, count/validation, schedule/delay/hourly controls | Implemented; request shape inspected against backend | End-to-end scheduling verification; server config remains authoritative | P1 |
 | Loading/empty/error UI | Dashboard loading, empty, retry/error states; partial schedule failure notice | Implemented; production build PASS | Browser/accessibility review | P1 |
@@ -195,7 +204,7 @@ No dependency installation was attempted. No environment values were read. `.env
 - **Verified:** root `.env` was not written or overwritten; `.env.example` contains placeholders only. No credential values were read or added.
 - **Verified:** Node 22.23.3/npm 10.9.9 were restored under `/tmp/reachinbox-node22`; system Node 18/npm 9 were unchanged. Compose/MySQL/Redis run with elevated Docker access. MySQL uses host port 13306 and existing named data volumes were retained.
 - **Runtime constraint:** Elasticsearch is currently `Up (unhealthy)` and the host probe cannot connect. Its logs confirm the 90% disk watermark (44.7 GB free / 9.8%) and an unassigned primary shard. I did not disable the safety threshold or delete data.
-- **Still requires setup:** restore sufficient disk headroom and verify live Elasticsearch indexing/search; configure `BULL_BOARD_TOKEN`, Google OAuth, SMTP, live Slack OAuth, and eventual deployment credentials. Never put real credentials in tracked files.
+- **Still requires setup:** restore sufficient disk headroom and verify live Elasticsearch indexing/search; configure `BULL_BOARD_TOKEN`, live Slack OAuth, and eventual deployment credentials. Google sign-in and Ethereal SMTP acceptance were tested as described above. Never put real credentials in tracked files.
 
 ## Risks and engineering decisions
 
@@ -205,24 +214,24 @@ No dependency installation was attempted. No environment values were read. `.env
 - SMTP acceptance is not confirmed delivery. Retries after uncertain SMTP outcomes can duplicate mail. Record this limitation and use stable message/job identifiers and conservative retry policy; exactly-once delivery is not guaranteed.
 - OAuth secrets and Slack tokens require secure environment configuration and protected storage. Missing Slack connections and expired/revoked tokens must not block email processing.
 - Starter Express/TypeScript dependency ranges remain `latest`; new scheduling dependencies are lockfile-backed. `npm install` reported four high-severity audit findings; no forced audit fix or broad dependency upgrade was run.
-- Actual SMTP delivery was not tested because no Ethereal credentials are configured. Mock transport tests cover worker state and retry behavior.
+- At the time of the initial audit, SMTP acceptance had not been tested. A later user-reported Ethereal test was accepted and its preview checked; this does not prove recipient-inbox delivery. Mock transport tests cover worker state and retry behavior.
 - Elasticsearch stores email bodies and recipient addresses for full-text search. The endpoint omits bodies, but indexed PII requires production TLS/authentication, controlled access, retention, and deletion handling. Search is not tenant-safe before application authentication.
 - Indexing is eventually consistent. The MySQL outbox is durable and retries continue at a capped one-hour interval; persistent schema/authentication errors can therefore remain pending until the cluster is repaired.
 
 ## Remaining work after backend foundation
 
-1. Implement real Google OAuth login/logout and user profile presentation.
-2. Configure Ethereal SMTP and restore Elasticsearch disk headroom for live service verification.
+1. No further Google sign-in setup remains for local verification; consider tenant ownership before multi-user deployment.
+2. Restore Elasticsearch disk headroom and run live search verification; Ethereal acceptance was checked, but recipient-inbox delivery remains unverified.
 3. Complete hosting, reviewer access, five-minute demo, and submission after remaining requirements are verified.
 
-**Dependencies:** the local Node 22/npm 10 toolchain and MySQL/Redis are now available; Docker commands require elevated socket access here, and MySQL is mapped to host port 13306 because 3306 is occupied. An Ethereal SMTP account/configuration and agreed application environment variables are still required. Do not invent credentials.
+**Dependencies:** the local Node 22/npm 10 toolchain and MySQL/Redis are now available; Docker commands require elevated socket access here, and MySQL is mapped to host port 13306 because 3306 is occupied. Ethereal SMTP acceptance was user-reported as verified. Do not treat its preview as proof of recipient-inbox delivery.
 
 ## Manual actions needed
 
-- Configure `SMTP_USER` and `SMTP_PASS` with actual Ethereal credentials to run the worker and verify real SMTP acceptance.
+- Ethereal acceptance was checked by the user; verify recipient-inbox delivery separately only if required.
 - Set `EMAIL_MIN_SEND_DELAY_MS` (milliseconds) and `SENDER_MAX_EMAILS_PER_HOUR` (rolling 60-minute default) in the environment as needed. A sender-specific `hourlyLimit` can be set on its `Sender` row; there is not yet a sender administration API.
 - Use the Node 22/npm 10 toolchain under `/tmp/reachinbox-node22` for validation in this environment; Docker commands need elevated socket access. MySQL is mapped to host port 13306 because 3306 is occupied. Set Elasticsearch credentials and `BULL_BOARD_TOKEN` in the untracked `.env` only when available.
-- Configure Google OAuth and eventual hosting credentials securely when those milestones begin. For Slack, create an app and provide the five documented optional environment values before OAuth can be used.
+- Google OAuth is configured and browser-tested in this environment. Configure eventual hosting credentials securely; for Slack, create an app and provide the five documented optional environment values before OAuth can be used.
 - Confirm GitHub repository privacy and reviewer invitations when ready to submit.
 
-This handoff records the backend scheduling, rate-limit, Slack, search/queue-monitoring, and frontend-dashboard milestones. Live Slack, SMTP, and Elasticsearch service verification remain incomplete; Google OAuth and deployment/submission work are outstanding.
+This handoff records the backend scheduling, rate-limit, Slack, search/queue-monitoring, frontend-dashboard, and Google sign-in milestones. Google browser sign-in/profile/logout and Ethereal SMTP acceptance/preview have been reported verified by the user. Live Slack and Elasticsearch service verification remain incomplete; recipient-inbox delivery and deployment/submission are also outstanding.

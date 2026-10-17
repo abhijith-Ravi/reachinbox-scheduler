@@ -125,7 +125,7 @@ test('mapping is explicit and indexing uses stable IDs with idempotent status up
   assert.equal(EMAIL_SEARCH_MAPPINGS.properties.status.type, 'keyword')
 
   const email = await createEmail()
-  assert.equal(await reconcileEmailSearchOutbox(prisma, es.client), 1)
+  assert.equal(await reconcileEmailSearchOutbox(prisma, es.client, 50, email.id), 1)
   const indexed = es.documents.get(email.id)
   assert.ok(indexed)
   assert.equal(indexed.version, 1)
@@ -134,7 +134,7 @@ test('mapping is explicit and indexing uses stable IDs with idempotent status up
 
   const acceptedAt = new Date()
   assert.equal(await updateEmailWithSearchOutbox(prisma, email.id, {}, { status: 'SENT', smtpAcceptedAt: acceptedAt }), 1)
-  assert.equal(await reconcileEmailSearchOutbox(prisma, es.client), 1)
+  assert.equal(await reconcileEmailSearchOutbox(prisma, es.client, 50, email.id), 1)
   assert.equal(es.documents.size, 1)
   assert.equal(es.documents.get(email.id)?.version, 2)
   assert.equal(es.documents.get(email.id)?.document.status, 'SENT')
@@ -145,7 +145,7 @@ test('mapping is explicit and indexing uses stable IDs with idempotent status up
 test('failed indexing stays durable and retries with delayed bounded backoff', async () => {
   const email = await createEmail()
   es.failIndexes = 1
-  assert.equal(await reconcileEmailSearchOutbox(prisma, es.client), 1)
+  assert.equal(await reconcileEmailSearchOutbox(prisma, es.client, 50, email.id), 1)
   const pending = await prisma.emailSearchOutbox.findFirstOrThrow({ where: { emailId: email.id } })
   assert.equal(pending.status, 'PENDING')
   assert.equal(pending.attemptCount, 1)
@@ -153,7 +153,7 @@ test('failed indexing stays durable and retries with delayed bounded backoff', a
   assert.equal(pending.lastError, 'Elasticsearch indexing request failed.')
 
   await prisma.emailSearchOutbox.update({ where: { id: pending.id }, data: { nextAttemptAt: new Date(Date.now() - 1) } })
-  assert.equal(await reconcileEmailSearchOutbox(prisma, es.client), 1)
+  assert.equal(await reconcileEmailSearchOutbox(prisma, es.client, 50, email.id), 1)
   assert.equal((await prisma.emailSearchOutbox.findUniqueOrThrow({ where: { id: pending.id } })).status, 'INDEXED')
 })
 
@@ -165,11 +165,11 @@ test('an older in-flight write cannot overwrite newer MySQL email state', async 
   const oldWriteGate = new Promise<void>((resolve) => { releaseOldWrite = resolve })
   es.delayVersionOne = () => oldWriteGate
   es.onVersionOne = reachedOldWrite
-  const oldReconcile = reconcileEmailSearchOutbox(prisma, es.client)
+  const oldReconcile = reconcileEmailSearchOutbox(prisma, es.client, 50, email.id)
   await oldWriteReached
 
   await updateEmailWithSearchOutbox(prisma, email.id, {}, { status: 'SENT', smtpAcceptedAt: new Date() })
-  await reconcileEmailSearchOutbox(prisma, es.client)
+  await reconcileEmailSearchOutbox(prisma, es.client, 50, email.id)
   releaseOldWrite()
   await oldReconcile
   es.delayVersionOne = undefined
@@ -183,7 +183,7 @@ test('an older in-flight write cannot overwrite newer MySQL email state', async 
 
 test('search API validates filters and pagination and returns a stable response without body text', async () => {
   const email = await createEmail()
-  await reconcileEmailSearchOutbox(prisma, es.client)
+  await reconcileEmailSearchOutbox(prisma, es.client, 50, email.id)
   const invalid = await fetch(`${baseUrl}/api/emails/search?page=0&pageSize=1000`)
   assert.equal(invalid.status, 400)
 
@@ -236,7 +236,7 @@ test('Bull Board protects all routes and registers the email and Slack queues', 
 
 test('search outbox reconciler recovers pending rows after process restart', async () => {
   const email = await createEmail()
-  const reconciler = startEmailSearchReconciler(prisma, es.client, 30_000)
+  const reconciler = startEmailSearchReconciler(prisma, es.client, 30_000, email.id)
   try {
     for (let attempt = 0; attempt < 30 && !es.documents.has(email.id); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 50))
     assert.equal(es.documents.get(email.id)?.document.id, email.id)
@@ -257,7 +257,7 @@ test('live Elasticsearch outbox indexing and search round trip when configured',
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const row = await prisma.emailSearchOutbox.findUniqueOrThrow({ where: { emailId_version: { emailId: email.id, version: target.searchVersion } } })
       if (row.status === 'INDEXED') break
-      await reconcileEmailSearchOutbox(prisma, liveElasticsearch!, 1000)
+      await reconcileEmailSearchOutbox(prisma, liveElasticsearch!, 1000, email.id)
     }
     await liveElasticsearch!.indices.refresh({ index: EMAIL_SEARCH_INDEX })
     const result = await searchEmails(liveElasticsearch!, { q: 'Searchable body text', status: 'SCHEDULED', senderId: testSenderId, page: 1, pageSize: 10 })

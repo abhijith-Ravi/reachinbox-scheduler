@@ -1,4 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+
+type GoogleUser = { id: string; email: string; name: string; picture: string | null }
+
+declare global {
+  interface Window {
+    google?: { accounts: { id: {
+      initialize(options: { client_id: string; callback(response: { credential: string }): void }): void
+      renderButton(element: HTMLElement, options: Record<string, string | number>): void
+      prompt(callback?: (notification: { isDismissedMoment(): boolean; isSkippedMoment(): boolean }) => void): void
+      disableAutoSelect(): void
+    } } }
+  }
+}
 
 type EmailRecord = {
   id: string
@@ -23,6 +36,7 @@ type EmailTab = 'scheduled' | 'sent'
 type ParsedRecipients = { valid: string[]; invalid: string[]; duplicates: number }
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID?.trim() || ''
 const EMAIL_PATTERN = /[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?)+/gi
 
 async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
@@ -129,6 +143,11 @@ function formatDate(value: string | null): string {
 }
 
 export default function App() {
+  const [authState, setAuthState] = useState<'checking' | 'disabled' | 'required' | 'configuration-error' | 'unavailable'>('checking')
+  const [authUser, setAuthUser] = useState<GoogleUser | null>(null)
+  const [authError, setAuthError] = useState('')
+  const [authPending, setAuthPending] = useState(false)
+  const googleButtonRef = useRef<HTMLDivElement>(null)
   const [activeTab, setActiveTab] = useState<EmailTab>('scheduled')
   const [scheduled, setScheduled] = useState<EmailRecord[]>([])
   const [sent, setSent] = useState<EmailRecord[]>([])
@@ -158,6 +177,79 @@ export default function App() {
   const currentError = activeTab === 'scheduled' ? refreshError.scheduled : refreshError.sent
   const nextCursor = activeTab === 'scheduled' ? scheduledCursor : sentCursor
 
+  useEffect(() => {
+    let mounted = true
+    void apiRequest<{ data: { enabled: boolean; configurationError: boolean; user: GoogleUser | null } }>('/api/auth/session')
+      .then(({ data }) => {
+        if (!mounted) return
+        setAuthUser(data.user)
+        setAuthState(data.configurationError ? 'configuration-error' : data.enabled ? 'required' : 'disabled')
+      })
+      .catch(() => { if (mounted) setAuthState('unavailable') })
+    return () => { mounted = false }
+  }, [])
+
+  useEffect(() => {
+    if (authState !== 'required' || authUser || !googleButtonRef.current) return
+    if (!GOOGLE_CLIENT_ID) {
+      setAuthError('Set VITE_GOOGLE_CLIENT_ID to the Web OAuth client ID, then restart Vite.')
+      return
+    }
+    let attempts = 0
+    let initialized = false
+    const timer = window.setInterval(() => {
+      attempts += 1
+      const google = window.google
+      const element = googleButtonRef.current
+      if (!google || !element) {
+        if (attempts >= 50) {
+          window.clearInterval(timer)
+          setAuthError('Google sign-in could not load. Check your connection and reload this page.')
+        }
+        return
+      }
+      window.clearInterval(timer)
+      if (initialized) return
+      initialized = true
+      google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: async ({ credential }) => {
+          setAuthError('')
+          setAuthPending(true)
+          try {
+            const result = await apiRequest<{ data: { user: GoogleUser } }>('/api/auth/google', {
+              method: 'POST',
+              body: JSON.stringify({ credential }),
+            })
+            setAuthUser(result.data.user)
+            setAuthError('')
+          } catch (error) {
+            setAuthError(errorMessage(error))
+          } finally {
+            setAuthPending(false)
+          }
+        },
+      })
+      google.accounts.id.renderButton(element, { type: 'standard', theme: 'outline', size: 'large', text: 'signin_with', shape: 'rectangular', width: 320 })
+      google.accounts.id.prompt((notification) => {
+        if (notification.isDismissedMoment() || notification.isSkippedMoment()) setAuthError('Sign-in was cancelled. Select the Google button to try again.')
+      })
+    }, 200)
+    return () => window.clearInterval(timer)
+  }, [authState, authUser])
+
+  async function logout() {
+    try {
+      await apiRequest('/api/auth/logout', { method: 'POST' })
+      window.google?.accounts.id.disableAutoSelect()
+      setAuthUser(null)
+      setAuthState('required')
+      setAuthError('You have been signed out.')
+    } catch (error) {
+      setAuthError(`Could not sign out: ${errorMessage(error)}`)
+    }
+  }
+
   const refreshDashboard = useCallback(async () => {
     setLoading(true)
     setRefreshError({})
@@ -181,7 +273,10 @@ export default function App() {
     setLoading(false)
   }, [])
 
-  useEffect(() => { void refreshDashboard() }, [refreshDashboard])
+  useEffect(() => {
+    if (authState === 'required' && !authUser) return
+    void refreshDashboard()
+  }, [authState, authUser, refreshDashboard])
 
   useEffect(() => {
     if (!composeOpen) return
@@ -322,6 +417,10 @@ export default function App() {
     setComposeOpen(false)
   }
 
+  if (authState === 'checking') return <main className="auth-shell"><section className="auth-card" aria-live="polite">Checking sign-in status…</section></main>
+  if (authState === 'configuration-error') return <main className="auth-shell"><section className="auth-card"><h1>Google sign-in setup is incomplete</h1><p>Configure both <code>GOOGLE_CLIENT_ID</code> and <code>GOOGLE_SESSION_SECRET</code> in the backend environment, then restart the API.</p></section></main>
+  if (authState === 'required' && !authUser) return <main className="auth-shell"><section className="auth-card"><div className="brand-mark auth-brand-mark"><BrandIcon /></div><p className="eyebrow">REACHINBOX</p><h1>Sign in to your workspace</h1><p className="auth-copy">Use your Google account to continue to the email scheduler.</p><div ref={googleButtonRef} className="google-button" aria-busy={authPending} />{authPending && <p className="auth-pending" role="status">Verifying your Google account…</p>}{authError && <p className="auth-error" role="alert">{authError}</p>}</section></main>
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -338,9 +437,9 @@ export default function App() {
           <p className="tip-copy">Schedule thoughtfully and let ReachInbox take care of the timing.</p>
         </div>
         <div className="profile-row">
-          <div className="profile-avatar">R</div>
-          <div className="profile-text"><strong>ReachInbox</strong><span>Workspace</span></div>
-          <MoreIcon />
+          {authUser?.picture ? <img className="profile-avatar profile-image" src={authUser.picture} alt="" referrerPolicy="no-referrer" /> : <div className="profile-avatar">{authUser?.name.charAt(0).toUpperCase() || 'R'}</div>}
+          <div className="profile-text"><strong>{authUser?.name || 'ReachInbox'}</strong><span>{authUser?.email || 'Workspace'}</span></div>
+          {authUser && <button className="logout-button" type="button" onClick={() => void logout()}>Log out</button>}
         </div>
       </aside>
 
@@ -364,6 +463,7 @@ export default function App() {
           </section>
 
           {submitNotice && <div className="toast-success" role="status"><CheckIcon /> {submitNotice}</div>}
+          {authError && authUser && <div className="auth-session-error" role="alert">{authError}</div>}
 
           <section className="stats-grid" aria-label="Email overview">
             <StatCard label="Scheduled" value={scheduled.length} helper="Emails in this view" icon={<ClockIcon />} accent="violet" />
@@ -513,7 +613,6 @@ function ClockIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><circl
 function SendIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21 3-7.2 18-3.7-7.1L3 10.2 21 3Z" /><path d="m10.1 13.9 4.2-4.2" /></svg> }
 function PeopleIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3" /><path d="M3.5 19a5.5 5.5 0 0 1 11 0M16 5.5a3 3 0 0 1 0 5.8M17 14a5 5 0 0 1 3.5 4.8" /></svg> }
 function SparkleIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z" /><path d="m19 16 .9 2.1L22 19l-2.1.9L19 22l-.9-2.1L16 19l2.1-.9L19 16Z" /></svg> }
-function MoreIcon() { return <svg className="more-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></svg> }
 function CheckIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6" /></svg> }
 function UploadIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v5h14v-5" /></svg> }
 function CalendarIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2" /><path d="M7.5 3v4M16.5 3v4M4 9.5h16" /></svg> }

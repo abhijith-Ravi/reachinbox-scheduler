@@ -7,6 +7,7 @@ import { enqueueEmailById, reconcileScheduledEmails } from './outbox'
 import { SlackIntegration } from './slack-integration'
 import { createSlackNotificationQueue } from './slack-queue'
 import { createElasticsearchClient } from './email-search'
+import { GoogleAuthService } from './google-auth'
 
 async function main(): Promise<void> {
   await prisma.$connect()
@@ -18,6 +19,10 @@ async function main(): Promise<void> {
   const slackRedis = new Redis(redisConnection)
   await slackRedis.ping()
   const elasticsearch = createElasticsearchClient()
+  const googleAuthRequired = Boolean(config.GOOGLE_CLIENT_ID || config.GOOGLE_SESSION_SECRET)
+  const googleAuth = config.GOOGLE_CLIENT_ID && config.GOOGLE_SESSION_SECRET
+    ? new GoogleAuthService(config.GOOGLE_CLIENT_ID, config.GOOGLE_SESSION_SECRET)
+    : undefined
   const recovered = await reconcileScheduledEmails(prisma, queue)
   if (recovered) console.info(`Reconciled ${recovered} persisted scheduled email(s).`)
 
@@ -30,6 +35,9 @@ async function main(): Promise<void> {
     bullBoardQueues: [queue, slackNotificationQueue],
     bullBoardToken: config.BULL_BOARD_TOKEN,
     elasticsearch,
+    googleAuth,
+    googleAuthRequired,
+    secureCookies: config.NODE_ENV === 'production',
   })
   const server = app.listen(config.API_PORT, () => console.info(`ReachInbox API listening on port ${config.API_PORT}`))
 

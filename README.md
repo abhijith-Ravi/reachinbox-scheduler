@@ -68,11 +68,19 @@ curl -H "Authorization: Bearer $BULL_BOARD_TOKEN" \
   http://127.0.0.1:3000/admin/queues/api/queues
 ```
 
-No authenticated application user system exists yet, so the token is deployment-wide administrative access, not per-user authorization.
+Google sign-in authenticates application users, but the queue token remains deployment-wide administrative access, not per-user authorization.
 
 ## Frontend dashboard
 
 The React dashboard reads scheduled and sent emails from `GET /api/emails/scheduled` and `GET /api/emails/sent`, using the backend's `limit`/`cursor` pagination response. The compose dialog accepts recipient addresses as text or CSV, reports valid/invalid/duplicate addresses, and submits one request per recipient to the existing `POST /api/emails/schedule` contract. Each request sends `senderId`, `recipient`, `subject`, `body`, `scheduledAt`, and a stable campaign-scoped `idempotencyKey`.
+
+### Google sign-in
+
+Create a Google Cloud OAuth client with application type **Web application**. Configure the authorized JavaScript origin as `http://localhost:5173` (also add `http://127.0.0.1:5173` only if using that host) and add the production frontend origin when deployed. This popup-based Google Identity Services flow does not use a redirect URI or Google client secret.
+
+Set `GOOGLE_CLIENT_ID` in the repository-root `.env` and the same public value as `VITE_GOOGLE_CLIENT_ID` in `frontend/.env`. Generate `GOOGLE_SESSION_SECRET` locally with `openssl rand -hex 32` and keep it only in the root `.env`. The API verifies Google's signed ID token with `google-auth-library`, requires a verified email, then issues an eight-hour HMAC-signed `HttpOnly`, `SameSite=Lax` cookie (`Secure` in production). The browser does not store the Google credential; logout clears the cookie. Once either backend setting is present, email list, search, detail, and schedule routes require a valid session. Configure both backend settings together; a half-configured server fails closed.
+
+No user/tenant ownership model exists in MySQL. Google sign-in identifies the caller, but signed-in users on this deployment still share its email records; this is not tenant isolation. Google sign-in, verified profile display, and logout were exercised in the browser with the configured Google client. Never commit `.env`; create `frontend/.env` from its example only if it does not already exist.
 
 The start time, minimum delay (seconds), and hourly limit controls spread the campaign's individual `scheduledAt` values. These controls do not change backend configuration: the Redis sender-wide delay and hourly quota remain authoritative, and may delay sends further. The selected hourly limit scopes the current campaign's planned schedule only.
 
@@ -84,11 +92,11 @@ if [ ! -f .env ]; then cp .env.example .env; fi
 npm run dev
 ```
 
-`VITE_API_BASE_URL` is the frontend API setting. It defaults to same-origin paths; Vite's development proxy forwards `/api` and `/health` to `http://127.0.0.1:3000`. For production, serve the API through the same-origin reverse proxy or provide an API origin that already permits browser access; this backend does not configure CORS. Do not put secrets in `VITE_` variables because Vite embeds them in client bundles.
+`VITE_API_BASE_URL` is the frontend API setting. It defaults to same-origin paths; Vite's development proxy forwards `/api` and `/health` to `http://127.0.0.1:3000`. For production, serve the API through the same-origin reverse proxy or provide an API origin that already permits browser access; this backend does not configure CORS. `VITE_GOOGLE_CLIENT_ID` is public and is the only Google value exposed to the browser; do not put secrets in `VITE_` variables because Vite embeds them in client bundles.
 
 ## Prerequisites and setup
 
-- Node.js 22 LTS (20+ supported by the code) and npm 10+
+- Node.js 22 LTS and npm 10+
 - Docker Compose v2 with access to the Docker daemon
 - MySQL 8.4 and Redis 7.4 (provided by the root Compose file)
 - Ethereal SMTP credentials to actually deliver test messages; API and mocked-SMTP tests do not require them
@@ -127,6 +135,8 @@ The backend loads the repository-root `.env` when started from `backend/`. Exist
 | `API_PORT` | No | `3000` | Express listen port. |
 | `DEFAULT_SENDER_EMAIL` | Yes | `hello@example.com` | Address for the seeded `default` sender. |
 | `DEFAULT_SENDER_NAME` | No | `ReachInbox Development` | Display name for the seeded sender. |
+| `GOOGLE_CLIENT_ID` | No | empty | Google Cloud Web OAuth client ID; enables verified Google sign-in. |
+| `GOOGLE_SESSION_SECRET` | No | empty | At least 32 characters; HMAC key for the eight-hour HttpOnly session cookie. Configure together with the client ID. |
 | `SMTP_HOST` | No | `smtp.ethereal.email` | SMTP server hostname. |
 | `SMTP_PORT` | No | `587` | SMTP server port. |
 | `SMTP_USER` / `SMTP_PASS` | Worker only | empty | Ethereal credentials; worker refuses to start if either is missing. Never stored in MySQL or logged. |
@@ -207,7 +217,7 @@ npm run build
 npm test
 ```
 
-The automated suite uses the configured development MySQL/Redis services and a mocked SMTP transport; it creates uniquely keyed test records and cleans up those records/jobs. It does not send email. To check actual Ethereal delivery, configure credentials and a future schedule, start the API and worker, then inspect the returned email record and Ethereal preview link.
+The automated suite uses the configured development MySQL/Redis services and a mocked SMTP transport; it creates uniquely keyed test records and cleans up those records/jobs. Separately, a scheduled test message was accepted by Ethereal SMTP and its preview confirmed the recipient, subject, and body. This verifies SMTP acceptance and the Ethereal preview only, not delivery to a recipient inbox.
 
 ## Slack OAuth and quota alerts
 
@@ -255,13 +265,13 @@ The backend suite includes Redis-backed state expiry/single-use tests and mocked
 
 ## Current validation results (2026-10-17)
 
-Using Node.js 22.23.3/npm 10.9.9 from a temporary toolchain under `/tmp`, Prisma client generation, schema validation, migration status, backend typecheck, production build, Compose configuration validation, `git diff --check`, and the complete backend suite passed. The database reports all five migrations applied. The suite reports 39 passed, 0 failed, and 1 skipped: 19 scheduler tests use MySQL/Redis, the search tests use MySQL and a mocked Elasticsearch client (with Redis for Bull Board), and the Slack tests use MySQL/Redis with Slack HTTP mocked. The live Elasticsearch round-trip was not verified. The container is currently unhealthy because Elasticsearch's 90% disk watermark is exceeded and its primary shard is unassigned; search functionality needs to be rechecked after disk headroom is restored. No live Slack OAuth/message delivery or SMTP delivery was tested.
+Using Node.js 22.23.3/npm 10.9.9 from a temporary toolchain under `/tmp`, Prisma client generation, schema validation, migration status, backend typecheck, production build, Compose configuration validation, `git diff --check`, and the complete backend suite passed. The database reports all five migrations applied. That earlier run reported 39 passed, 0 failed, and 1 skipped. A later full serial suite including Google authentication reports 42 passed, 0 failed, and 1 skipped. Scheduler/auth/API/outbox tests use development MySQL/Redis; Elasticsearch tests use a mocked client except for the skipped live round-trip; Slack HTTP is mocked. The live Elasticsearch round-trip was not verified. The container is currently unhealthy because Elasticsearch's 90% disk watermark is exceeded and its primary shard is unassigned; search functionality needs to be rechecked after disk headroom is restored. No live Slack OAuth/message delivery was tested. A later user-reported test confirmed Google sign-in/profile/logout and Ethereal SMTP acceptance/preview; recipient-inbox delivery is not claimed.
 
 For the frontend milestone, `npm run build` in `frontend/` passed under Node 22.23.3/npm 10.9.9. There is no frontend test script or test framework in the starter package. A manual headless Chrome smoke test confirmed the dashboard renders without a blank screen or application exceptions, both list empty states render, and a mocked API error shows its message and retry button. The test used a temporary localhost response stub; it did not submit through the live backend. Request fields and response parsing were checked against the backend routes. The provided Figma URL was inaccessible from the available inspection tools, so the interface has not been visually compared with that reference.
 
 ## Current limitations
 
-- No application user authentication/Google OAuth, sender administration API, or per-sender SMTP credentials. Search and Bull Board remain deployment-wide backend features, not tenant-isolated UI features.
+- Google sign-in authenticates users, but the app has no database user/tenant ownership model; signed-in users share deployment-wide email records. Sender administration and per-sender SMTP credentials are also absent. Search and Bull Board remain deployment-wide backend features.
 - Sender identities are stored in MySQL; `default` is seeded from environment configuration. Additional sender rows can be added through a future administrative path.
 - SMTP delivery is at-least-once under ambiguous crashes. MySQL state and SMTP acceptance cannot be committed atomically.
 - Redis rate reservations are atomic across workers but are not committed atomically with MySQL or SMTP. Redis data loss can reset recent quota history; a reservation made before a crash may conservatively use quota without an SMTP attempt.

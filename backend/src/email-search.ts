@@ -96,11 +96,12 @@ export async function queueInitialEmailSearchInTransaction(tx: Prisma.Transactio
   await tx.emailSearchOutbox.create({ data: { emailId, version } })
 }
 
-export async function reconcileEmailSearchOutbox(db: PrismaClient, client: Client, batchSize = SEARCH_BATCH_SIZE): Promise<number> {
+export async function reconcileEmailSearchOutbox(db: PrismaClient, client: Client, batchSize = SEARCH_BATCH_SIZE, onlyEmailId?: string): Promise<number> {
   await ensureEmailSearchIndex(client)
   const now = new Date()
   const candidates = await db.emailSearchOutbox.findMany({
     where: {
+      ...(onlyEmailId ? { emailId: onlyEmailId } : {}),
       OR: [
         { status: 'PENDING', nextAttemptAt: { lte: now } },
         { status: 'PROCESSING', leaseExpiresAt: { lte: now } },
@@ -194,6 +195,7 @@ export function startEmailSearchReconciler(
   db: PrismaClient,
   client: Client,
   intervalMs = 5_000,
+  onlyEmailId?: string,
 ): { close: () => Promise<void> } {
   let running = false
   let stopped = false
@@ -210,7 +212,7 @@ export function startEmailSearchReconciler(
     running = true
     inFlight = (async () => {
       try {
-        await reconcileEmailSearchOutbox(db, client)
+        await reconcileEmailSearchOutbox(db, client, SEARCH_BATCH_SIZE, onlyEmailId)
         retryDelayMs = intervalMs
       } catch {
         console.error('Email search indexing reconciliation failed.')

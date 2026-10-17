@@ -12,6 +12,7 @@ import { SlackIntegration, SlackOAuthError } from './slack-integration'
 import { listFailedNotifications, NotificationNotFoundError, NotificationStateError, replayFailedNotification } from './slack-notifications'
 import type { SlackNotificationJobData } from './slack-queue'
 import { SearchUnavailableError, searchEmails } from './email-search'
+import { GoogleAuthService, GoogleAuthenticationError, googleSessionFromCookieHeader } from './google-auth'
 
 const scheduleSchema = z.object({
   senderId: z.string().min(1).max(64).default('default'),
@@ -45,6 +46,9 @@ interface AppDependencies {
   bullBoardQueues?: Queue[]
   bullBoardToken?: string
   elasticsearch?: Client | null
+  googleAuth?: GoogleAuthService
+  googleAuthRequired?: boolean
+  secureCookies?: boolean
 }
 
 export function createApp(dependencies: AppDependencies) {
@@ -67,6 +71,39 @@ export function createApp(dependencies: AppDependencies) {
   }, dashboardAdapter?.getRouter() ?? ((_request, response) => apiError(response, 503, 'QUEUE_DASHBOARD_UNAVAILABLE', 'The queue dashboard is not configured.')))
 
   app.get('/health', (_request, response) => response.status(200).json({ status: 'ok' }))
+
+  app.get('/api/auth/session', (request, response) => {
+    response.setHeader('Cache-Control', 'no-store')
+    const user = dependencies.googleAuth?.readSession(googleSessionFromCookieHeader(request.headers.cookie)) ?? null
+    return response.json({ data: { enabled: Boolean(dependencies.googleAuth), configurationError: Boolean(dependencies.googleAuthRequired && !dependencies.googleAuth), user } })
+  })
+
+  app.post('/api/auth/google', async (request, response) => {
+    if (!dependencies.googleAuth) return apiError(response, 503, 'GOOGLE_AUTH_NOT_CONFIGURED', 'Google sign-in is not fully configured on the server.')
+    const parsed = z.object({ credential: z.string().min(20).max(10_000) }).strict().safeParse(request.body)
+    if (!parsed.success) return apiError(response, 400, 'VALIDATION_ERROR', 'A Google sign-in credential is required.')
+    try {
+      const { user, cookieValue } = await dependencies.googleAuth.authenticate(parsed.data.credential)
+      response.setHeader('Cache-Control', 'no-store')
+      response.setHeader('Set-Cookie', dependencies.googleAuth.cookie(cookieValue, dependencies.secureCookies ?? false))
+      return response.status(200).json({ data: { user } })
+    } catch (error) {
+      if (error instanceof GoogleAuthenticationError) return apiError(response, 401, 'GOOGLE_AUTH_FAILED', error.message)
+      return apiError(response, 401, 'GOOGLE_AUTH_FAILED', 'Google sign-in could not be verified. Please try again.')
+    }
+  })
+
+  app.post('/api/auth/logout', (_request, response) => {
+    response.setHeader('Set-Cookie', dependencies.googleAuth?.clearCookie(dependencies.secureCookies ?? false) ?? 'reachinbox_session=; HttpOnly; Path=/api; SameSite=Lax; Max-Age=0')
+    return response.json({ data: { loggedOut: true } })
+  })
+
+  app.use('/api/emails', (request, response, next) => {
+    if (!dependencies.googleAuthRequired) return next()
+    if (!dependencies.googleAuth) return apiError(response, 503, 'GOOGLE_AUTH_NOT_CONFIGURED', 'Google sign-in is not fully configured on the server.')
+    if (!dependencies.googleAuth.readSession(googleSessionFromCookieHeader(request.headers.cookie))) return apiError(response, 401, 'AUTHENTICATION_REQUIRED', 'Sign in with Google to access email scheduling.')
+    return next()
+  })
 
   app.get('/api/slack/oauth/start', async (request, response) => {
     if (!dependencies.slack) return apiError(response, 503, 'SLACK_NOT_CONFIGURED', 'Slack integration is not configured.')
