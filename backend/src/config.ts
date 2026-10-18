@@ -1,5 +1,6 @@
 import dotenv from 'dotenv'
 import { z } from 'zod'
+import { resolveApiPort } from './api-port'
 
 dotenv.config({ path: process.env.DOTENV_CONFIG_PATH ?? '../.env' })
 
@@ -12,6 +13,7 @@ const envSchema = z.object({
   REDIS_PORT: positiveInteger(6379),
   REDIS_PASSWORD: z.string().optional(),
   API_PORT: positiveInteger(3000),
+  PORT: z.coerce.number().int().positive().optional(),
   DEFAULT_SENDER_EMAIL: z.email(),
   DEFAULT_SENDER_NAME: z.string().optional(),
   GOOGLE_CLIENT_ID: optionalNonEmpty,
@@ -49,4 +51,8 @@ if (!parsed.success) {
   throw new Error(`Invalid environment configuration: ${issues.join('; ')}`)
 }
 
-export const config = { ...parsed.data, SMTP_SECURE: parsed.data.SMTP_SECURE === 'true' }
+export const config = {
+  ...parsed.data,
+  API_PORT: resolveApiPort(parsed.data.PORT, parsed.data.API_PORT),
+  SMTP_SECURE: parsed.data.SMTP_SECURE === 'true',
+}
