@@ -272,18 +272,5 @@ npm run build
 
 **Video link:** `[Add demo video URL]`
 
-Suggested demo sequence (under five minutes):
 
-1. Sign in with Google and show the dashboard.
-2. Schedule a message for about one minute in the future to an Ethereal test recipient and show campaign pacing options.
-3. Stop the worker before the scheduled time, restart it before it is due, and verify the future scheduled message still sends after its due time.
-4. Open the Ethereal preview and show SMTP acceptance; explain that it is a test mailbox, not a real inbox delivery.
-5. Briefly show search or the protected queue dashboard, if configured.
 
-## Submission checklist
-
-- [ ] Confirm the GitHub repository is private.
-- [ ] Invite `Mitrajit` and `Yadav036` to the repository with the required access.
-- [ ] Add the demo video link above.
-- [ ] Check that `.env`, `frontend/.env`, and `backend/.env.local-worker` are not committed.
-- [ ] Verify the documented deployment state and validation results before submission.
