@@ -49,11 +49,32 @@ interface AppDependencies {
   googleAuth?: GoogleAuthService
   googleAuthRequired?: boolean
   secureCookies?: boolean
+  frontendOrigin?: string
 }
 
 export function createApp(dependencies: AppDependencies) {
   const app = express()
   app.disable('x-powered-by')
+  if (dependencies.frontendOrigin) {
+    app.use((request, response, next) => {
+      const origin = request.get('Origin')
+      if (!origin) return next()
+      if (origin !== dependencies.frontendOrigin) {
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
+          return apiError(response, 403, 'ORIGIN_NOT_ALLOWED', 'This browser origin is not allowed.')
+        }
+        return next()
+      }
+
+      response.setHeader('Access-Control-Allow-Origin', dependencies.frontendOrigin)
+      response.setHeader('Access-Control-Allow-Credentials', 'true')
+      response.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+      response.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+      response.setHeader('Vary', 'Origin')
+      if (request.method === 'OPTIONS') return response.sendStatus(204)
+      return next()
+    })
+  }
   app.use(express.json({ limit: '1mb' }))
 
   const dashboardAdapter = dependencies.bullBoardQueues?.length

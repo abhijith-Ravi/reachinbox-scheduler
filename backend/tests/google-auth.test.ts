@@ -8,6 +8,7 @@ import { GoogleAuthService, type GoogleTokenClaims } from '../src/google-auth'
 
 const clientId = 'test-google-client.apps.googleusercontent.com'
 const secret = 'test-session-signing-secret-with-more-than-32-characters'
+const frontendOrigin = 'https://frontend.example.com'
 let server: Server | undefined
 let baseUrl = ''
 let claims: GoogleTokenClaims = { sub: 'google-user-123', email: 'person@example.com', email_verified: true, name: 'Test Person', picture: 'https://example.com/avatar.png' }
@@ -20,7 +21,7 @@ const googleAuth = new GoogleAuthService(clientId, secret, async (credential, au
 
 before(async () => {
   const fakePrisma = { email: { findMany: async () => [] } } as unknown as PrismaClient
-  server = createServer(createApp({ prisma: fakePrisma, enqueueEmail: async () => undefined, googleAuth, googleAuthRequired: true }))
+  server = createServer(createApp({ prisma: fakePrisma, enqueueEmail: async () => undefined, googleAuth, googleAuthRequired: true, secureCookies: true, frontendOrigin }))
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
   const address = server.address()
@@ -44,13 +45,34 @@ test('Google login verifies token claims, sets an HttpOnly session cookie, and r
   assert.doesNotMatch(JSON.stringify(body), /mock-valid-google-id-token|session-signing-secret/)
   const cookie = response.headers.get('set-cookie')
   assert.ok(cookie?.includes('HttpOnly'))
-  assert.ok(cookie?.includes('SameSite=Lax'))
+  assert.ok(cookie?.includes('SameSite=None'))
+  assert.ok(cookie?.includes('Secure'))
   assert.ok(cookie?.includes('Path=/api'))
   assert.ok(cookie?.includes('Max-Age=28800'))
   assert.ok(cookie)
 
   const session = await fetch(`${baseUrl}/api/auth/session`, { headers: { cookie: cookie.split(';')[0]! } })
   assert.deepEqual((await session.json() as { data: { enabled: boolean; user: unknown } }).data, { enabled: true, configurationError: false, user: body.data.user })
+})
+
+test('credentialed CORS is limited to the configured frontend origin', async () => {
+  const preflight = await fetch(`${baseUrl}/api/auth/google`, {
+    method: 'OPTIONS',
+    headers: {
+      origin: frontendOrigin,
+      'access-control-request-method': 'POST',
+      'access-control-request-headers': 'content-type',
+    },
+  })
+  assert.equal(preflight.status, 204)
+  assert.equal(preflight.headers.get('access-control-allow-origin'), frontendOrigin)
+  assert.equal(preflight.headers.get('access-control-allow-credentials'), 'true')
+
+  const rejected = await fetch(`${baseUrl}/api/auth/logout`, {
+    method: 'POST',
+    headers: { origin: 'https://attacker.example.com' },
+  })
+  assert.equal(rejected.status, 403)
 })
 
 test('invalid or unverified Google claims are rejected and email APIs require a valid session', async () => {
@@ -94,6 +116,8 @@ test('logout clears the cookie and invalid session signatures are rejected', asy
 
   const logout = await fetch(`${baseUrl}/api/auth/logout`, { method: 'POST' })
   assert.ok(logout.headers.get('set-cookie')?.includes('Max-Age=0'))
+  assert.ok(logout.headers.get('set-cookie')?.includes('SameSite=None'))
+  assert.ok(logout.headers.get('set-cookie')?.includes('Secure'))
   const loggedOutSession = await fetch(`${baseUrl}/api/auth/session`)
   assert.equal((await loggedOutSession.json() as { data: { user: unknown } }).data.user, null)
 })

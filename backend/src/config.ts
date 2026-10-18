@@ -6,12 +6,20 @@ dotenv.config({ path: process.env.DOTENV_CONFIG_PATH ?? '../.env' })
 
 const positiveInteger = (fallback: number) => z.coerce.number().int().positive().default(fallback)
 const optionalNonEmpty = z.preprocess((value) => value === '' ? undefined : value, z.string().min(1).optional())
+const optionalOrigin = z.preprocess(
+  (value) => value === '' ? undefined : value,
+  z.url().refine((value) => {
+    const url = new URL(value)
+    return ['http:', 'https:'].includes(url.protocol) && url.origin === value
+  }, 'FRONTEND_ORIGIN must be an HTTP(S) origin without a path').optional(),
+)
 
 const envSchema = z.object({
   DATABASE_URL: z.url().refine((value) => new URL(value).protocol === 'mysql:', 'DATABASE_URL must use the mysql: scheme'),
   REDIS_HOST: z.string().default('127.0.0.1'),
   REDIS_PORT: positiveInteger(6379),
   REDIS_PASSWORD: z.string().optional(),
+  FRONTEND_ORIGIN: optionalOrigin,
   API_PORT: positiveInteger(3000),
   PORT: z.coerce.number().int().positive().optional(),
   DEFAULT_SENDER_EMAIL: z.email(),

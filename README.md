@@ -78,7 +78,7 @@ The React dashboard reads scheduled and sent emails from `GET /api/emails/schedu
 
 Create a Google Cloud OAuth client with application type **Web application**. Configure the authorized JavaScript origin as `http://localhost:5173` (also add `http://127.0.0.1:5173` only if using that host) and add the production frontend origin when deployed. This popup-based Google Identity Services flow does not use a redirect URI or Google client secret.
 
-Set `GOOGLE_CLIENT_ID` in the repository-root `.env` and the same public value as `VITE_GOOGLE_CLIENT_ID` in `frontend/.env`. Generate `GOOGLE_SESSION_SECRET` locally with `openssl rand -hex 32` and keep it only in the root `.env`. The API verifies Google's signed ID token with `google-auth-library`, requires a verified email, then issues an eight-hour HMAC-signed `HttpOnly`, `SameSite=Lax` cookie (`Secure` in production). The browser does not store the Google credential; logout clears the cookie. Once either backend setting is present, email list, search, detail, and schedule routes require a valid session. Configure both backend settings together; a half-configured server fails closed.
+Set `GOOGLE_CLIENT_ID` in the repository-root `.env` and the same public value as `VITE_GOOGLE_CLIENT_ID` in `frontend/.env`. Generate `GOOGLE_SESSION_SECRET` locally with `openssl rand -hex 32` and keep it only in the root `.env`. For split frontend/API deployments, set backend `FRONTEND_ORIGIN` to the exact frontend origin and frontend `VITE_API_BASE_URL` to the API origin. The API allows credentialed CORS only from that origin. The browser includes credentials for API calls. The API verifies Google's signed ID token with `google-auth-library`, requires a verified email, then issues an eight-hour HMAC-signed `HttpOnly` session cookie. It uses `SameSite=None; Secure` in production for the cross-site Railway service domains and `SameSite=Lax` for local development. The cookie remains host-only on the API domain; logout clears it. Once either Google backend setting is present, email list, search, detail, and schedule routes require a valid session. Configure both backend settings together; a half-configured server fails closed.
 
 No user/tenant ownership model exists in MySQL. Google sign-in identifies the caller, but signed-in users on this deployment still share its email records; this is not tenant isolation. Google sign-in, verified profile display, and logout were exercised in the browser with the configured Google client. Never commit `.env`; create `frontend/.env` from its example only if it does not already exist.
 
@@ -92,7 +92,7 @@ if [ ! -f .env ]; then cp .env.example .env; fi
 npm run dev
 ```
 
-`VITE_API_BASE_URL` is the frontend API setting. It defaults to same-origin paths; Vite's development proxy forwards `/api` and `/health` to `http://127.0.0.1:3000`. For production, serve the API through the same-origin reverse proxy or provide an API origin that already permits browser access; this backend does not configure CORS. `VITE_GOOGLE_CLIENT_ID` is public and is the only Google value exposed to the browser; do not put secrets in `VITE_` variables because Vite embeds them in client bundles.
+`VITE_API_BASE_URL` is the frontend API setting. It defaults to same-origin paths; Vite's development proxy forwards `/api` and `/health` to `http://127.0.0.1:3000`. For a split production deployment, set it to the backend's HTTPS origin and set backend `FRONTEND_ORIGIN` to the frontend's exact HTTPS origin. `VITE_GOOGLE_CLIENT_ID` is public and is the only Google value exposed to the browser; do not put secrets in `VITE_` variables because Vite embeds them in client bundles.
 
 ## Prerequisites and setup
 
@@ -133,6 +133,7 @@ The backend loads the repository-root `.env` when started from `backend/`. Exist
 | `REDIS_PORT` | No | `6379` | Redis port. |
 | `REDIS_PASSWORD` | No | empty | Redis password if enabled. |
 | `API_PORT` | No | `3000` | Express listen port. |
+| `FRONTEND_ORIGIN` | Split frontend/API deployments | `http://localhost:5173` | Exact browser origin allowed to call the API with credentials; no path or trailing slash. |
 | `DEFAULT_SENDER_EMAIL` | Yes | `hello@example.com` | Address for the seeded `default` sender. |
 | `DEFAULT_SENDER_NAME` | No | `ReachInbox Development` | Display name for the seeded sender. |
 | `GOOGLE_CLIENT_ID` | No | empty | Google Cloud Web OAuth client ID; enables verified Google sign-in. |

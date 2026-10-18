@@ -38,6 +38,7 @@ async function main(): Promise<void> {
     googleAuth,
     googleAuthRequired,
     secureCookies: config.NODE_ENV === 'production',
+    frontendOrigin: config.FRONTEND_ORIGIN,
   })
   const server = app.listen(config.API_PORT, () => console.info(`ReachInbox API listening on port ${config.API_PORT}`))
 

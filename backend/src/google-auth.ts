@@ -77,11 +77,11 @@ export class GoogleAuthService {
   }
 
   cookie(value: string, secure: boolean): string {
-    return `${GOOGLE_SESSION_COOKIE}=${value}; HttpOnly; Path=/api; SameSite=Lax; Max-Age=${GOOGLE_SESSION_SECONDS}${secure ? '; Secure' : ''}`
+    return `${GOOGLE_SESSION_COOKIE}=${value}; HttpOnly; Path=/api; SameSite=${secure ? 'None' : 'Lax'}; Max-Age=${GOOGLE_SESSION_SECONDS}${secure ? '; Secure' : ''}`
   }
 
   clearCookie(secure: boolean): string {
-    return `${GOOGLE_SESSION_COOKIE}=; HttpOnly; Path=/api; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}`
+    return `${GOOGLE_SESSION_COOKIE}=; HttpOnly; Path=/api; SameSite=${secure ? 'None' : 'Lax'}; Max-Age=0${secure ? '; Secure' : ''}`
   }
 
   private sign(payload: string): string {

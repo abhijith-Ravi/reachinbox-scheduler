@@ -42,6 +42,7 @@ const EMAIL_PATTERN = /[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]*[A-Z0-
 async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
+    credentials: 'include',
     headers: { ...(init?.body ? { 'content-type': 'application/json' } : {}), ...init?.headers },
   })
   const payload = await response.json().catch(() => null) as { data?: T; error?: { message?: string } } | null
