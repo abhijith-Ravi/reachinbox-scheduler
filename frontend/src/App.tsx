@@ -46,6 +46,7 @@ async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   })
   const payload = await response.json().catch(() => null) as { data?: T; error?: { message?: string } } | null
   if (!response.ok) throw new Error(payload?.error?.message || `Request failed with status ${response.status}.`)
+  if (payload === null) throw new Error('The API returned an empty or invalid JSON response.')
   return payload as T
 }
 
