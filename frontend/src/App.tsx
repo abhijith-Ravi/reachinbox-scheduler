@@ -35,7 +35,7 @@ type EmailList = {
 type EmailTab = 'scheduled' | 'sent'
 type ParsedRecipients = { valid: string[]; invalid: string[]; duplicates: number }
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
+const API_BASE_URL = import.meta.env.DEV ? (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '') : ''
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID?.trim() || ''
 const EMAIL_PATTERN = /[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?)+/gi
 
